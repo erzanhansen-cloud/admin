@@ -189,6 +189,10 @@ def parse_dt(s):
         return None
 
 
+  def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def is_expired_row(expires_at: str) -> bool:
     dt = parse_dt(expires_at or "")
     return bool(dt and datetime.now() > dt)
