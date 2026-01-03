@@ -70,15 +70,15 @@ RUNNING_WINDOW_SEC = int(os.environ.get("RUNNING_WINDOW_SEC", "90"))  # heartbea
 # =========================
 
 def get_db():
-    # timeout helps avoid sqlite lock lag
-    conn = sqlite3.connect(DB_PATH, timeout=8)
+    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
+      conn.execute("PRAGMA journal_mode=WAL;")
+      conn.execute("PRAGMA synchronous=NORMAL;")
+      conn.execute("PRAGMA busy_timeout=8000;")  # ✅ важливо
+      conn.execute("PRAGMA foreign_keys=ON;")
     except sqlite3.OperationalError:
-        pass
+      pass
     return conn
 
 
@@ -1244,119 +1244,126 @@ def api_status():
 
 @app.route("/api/check_key", methods=["POST"])
 def api_check_key():
-    guard = maintenance_guard()
-    if guard:
-        return guard
+  guard = maintenance_guard()
+  if guard:
+    return guard
 
-    data = request.get_json(silent=True) or request.form
-    key_value = (data.get("key") or "").strip()
-    hwid = (data.get("hwid") or "").strip()
+  data = request.get_json(silent=True) or request.form
+  key_value = (data.get("key") or "").strip()
+  hwid = (data.get("hwid") or "").strip()
 
-    if not key_value or not hwid:
-        return jsonify({"ok": False, "reason": "missing"}), 400
+  if not key_value or not hwid:
+    return jsonify({"ok": False, "reason": "missing"}), 400
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM keys WHERE key_value=?", (key_value,))
-    row = cur.fetchone()
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT * FROM keys WHERE key_value=?", (key_value,))
+  row = cur.fetchone()
 
-    if not row:
-        conn.close()
-        return jsonify({"ok": False, "reason": "not_found"})
+  if not row:
+    conn.close()
+    return jsonify({"ok": False, "reason": "not_found"})
 
-    if not row["is_active"]:
-        conn.close()
-        return jsonify({"ok": False, "reason": "inactive"})
+  if not row["is_active"]:
+    conn.close()
+    return jsonify({"ok": False, "reason": "inactive"})
 
-    if row["is_banned"]:
-        conn.close()
-        return jsonify({"ok": False, "reason": "banned"})
+  if row["is_banned"]:
+    conn.close()
+    return jsonify({"ok": False, "reason": "banned"})
 
-    if is_expired_row(row["expires_at"]):
-        conn.close()
-        return jsonify({"ok": False, "reason": "expired"})
+  if is_expired_row(row["expires_at"]):
+    conn.close()
+    return jsonify({"ok": False, "reason": "expired"})
 
-    saved_hwid = (row["hwid"] or "").strip()
-    if saved_hwid and saved_hwid != hwid:
-        conn.close()
-        return jsonify({"ok": False, "reason": "hwid_mismatch"})
+  saved_hwid = (row["hwid"] or "").strip()
+  now = now_str()
 
-    ip = get_client_ip()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if not saved_hwid:
-        cur.execute("UPDATE keys SET hwid=? WHERE id=?", (hwid, row["id"]))
+  # ❗ АКТИВАЦІЯ ТІЛЬКИ 1 РАЗ
+  if not saved_hwid:
+    cur.execute("UPDATE keys SET hwid=? WHERE id=?",
+          (hwid, row["id"]))
 
     cur.execute(
-        "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
-        (row["id"], row["key_value"], hwid, ip, now),
+      "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
+      (row["id"], row["key_value"], hwid, get_client_ip(), now),
     )
+  else:
+    if saved_hwid != hwid:
+      conn.close()
+      return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
-    cur.execute("UPDATE keys SET last_seen=? WHERE id=?", (now, row["id"]))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({"ok": True, "reason": "ok"})
+  conn.commit()
+  conn.close()
+  return jsonify({"ok": True, "reason": "ok"})
 
 
 @app.route("/api/heartbeat", methods=["POST"])
 def api_heartbeat():
-    guard = maintenance_guard()
-    if guard:
-        return guard
+  guard = maintenance_guard()
+  if guard:
+    return guard
 
-    data = request.get_json(silent=True) or request.form
-    key_value = (data.get("key") or "").strip()
-    hwid = (data.get("hwid") or "").strip()
+  data = request.get_json(silent=True) or request.form
+  key_value = (data.get("key") or "").strip()
+  hwid = (data.get("hwid") or "").strip()
 
-    if not key_value or not hwid:
-        return jsonify({"ok": False, "reason": "missing"}), 400
+  if not key_value or not hwid:
+    return jsonify({"ok": False, "reason": "missing"}), 400
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, hwid, is_active, is_banned, expires_at FROM keys WHERE key_value=?", (key_value,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return jsonify({"ok": False, "reason": "not_found"})
+  conn = get_db()
+  cur = conn.cursor()
+  cur.execute("SELECT * FROM keys WHERE key_value=?", (key_value,))
+  row = cur.fetchone()
 
-    if not row["is_active"]:
-        conn.close()
-        return jsonify({"ok": False, "reason": "inactive"})
-
-    if row["is_banned"]:
-        conn.close()
-        return jsonify({"ok": False, "reason": "banned"})
-
-    if is_expired_row(row["expires_at"]):
-        conn.close()
-        return jsonify({"ok": False, "reason": "expired"})
-
-    saved_hwid = (row["hwid"] or "").strip()
-    if saved_hwid and saved_hwid != hwid:
-        conn.close()
-        return jsonify({"ok": False, "reason": "hwid_mismatch"})
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute("UPDATE keys SET last_seen=? WHERE id=?", (now, row["id"]))
-    conn.commit()
+  if not row:
     conn.close()
+    return jsonify({"ok": False, "reason": "not_found"})
 
-    return jsonify({"ok": True})
+  if row["hwid"] and row["hwid"] != hwid:
+    conn.close()
+    return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
+  if row["is_banned"] or not row["is_active"] or is_expired_row(row["expires_at"]):
+    conn.close()
+    return jsonify({"ok": False, "reason": "inactive"})
+
+  cur.execute(
+    "UPDATE keys SET last_seen=? WHERE id=?",
+    (now_str(), row["id"])
+  )
+  conn.commit()
+  conn.close()
+  return jsonify({"ok": True})
+
+
+SPAM_EVENTS = {
+    "license_ok",
+    "heartbeat_ok",
+    "update_check",
+}
 
 @app.route("/api/launcher/log", methods=["POST"])
 def api_launcher_log():
-    data = request.get_json(silent=True) or {}
-    event = (data.get("event") or "event").strip()
-    key_value = (data.get("key") or "").strip() or None
-    hwid = (data.get("hwid") or "").strip() or None
-    details = (data.get("details") or "").strip() or None
+      data = request.get_json(silent=True) or {}
+      event = (data.get("event") or "event").strip()
 
-    payload = {"hwid": hwid, "details": details}
-    log_action("launcher", event, None, key_value, json.dumps(payload, ensure_ascii=False))
-    return jsonify({"ok": True})
+      if event in SPAM_EVENTS:
+          return jsonify({"ok": True})
+
+      key_value = (data.get("key") or "").strip() or None
+      hwid = (data.get("hwid") or "").strip() or None
+      details = (data.get("details") or "").strip() or None
+
+      payload = {"hwid": hwid, "details": details}
+      log_action(
+          "launcher",
+          event,
+          None,
+          key_value,
+          json.dumps(payload, ensure_ascii=False),
+      )
+      return jsonify({"ok": True})
 
 
 # =========================
