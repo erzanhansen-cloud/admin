@@ -21,14 +21,34 @@ from werkzeug.utils import secure_filename
 
 
 # =========================
-# RENDER READY PATHS
+# PATHS (RENDER SAFE)
 # =========================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Render Persistent Disk: set DATA_DIR=/var/data in Render env
-DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
-os.makedirs(DATA_DIR, exist_ok=True)
+def pick_data_dir() -> str:
+    """
+    Priority:
+    1) DATA_DIR env if writable (Paid Render with disk)
+    2) fallback to ./data (works on Free; not persistent after redeploy/restart)
+    """
+    env_dir = (os.environ.get("DATA_DIR") or "").strip()
+    if env_dir:
+        try:
+            os.makedirs(env_dir, exist_ok=True)
+            test_file = os.path.join(env_dir, ".write_test")
+            with open(test_file, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_file)
+            return env_dir
+        except Exception:
+            pass
+
+    fallback = os.path.join(BASE_DIR, "data")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+DATA_DIR = pick_data_dir()
 
 DB_PATH = os.path.join(DATA_DIR, "db.sqlite3")
 STORAGE_DIR = os.path.join(DATA_DIR, "storage")
@@ -42,7 +62,6 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 app = Flask(__name__)
 app.secret_key = os.environ.get("APP_SECRET", "super-secret-local-key")
 ADMIN_PIN = os.environ.get("ADMIN_PIN", "Dev1234")
-
 RUNNING_WINDOW_SEC = int(os.environ.get("RUNNING_WINDOW_SEC", "90"))  # heartbeat window
 
 
@@ -82,10 +101,6 @@ def init_db():
         last_seen   TEXT
     )
     """)
-    try:
-        cur.execute("ALTER TABLE keys ADD COLUMN last_seen TEXT")
-    except sqlite3.OperationalError:
-        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS activations (
@@ -130,10 +145,12 @@ def init_db():
         maintenance_message TEXT
     )
     """)
+
     cur.execute("SELECT COUNT(*) AS c FROM app_settings")
     if cur.fetchone()["c"] == 0:
         cur.execute(
-            "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, 0, 'Тех роботи. Спробуй пізніше.')"
+            "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, 0, ?)",
+            ("Тех роботи. Спробуй пізніше.",),
         )
 
     # indexes
@@ -148,6 +165,10 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+# IMPORTANT: init db even when not running __main__ (gunicorn)
+init_db()
 
 
 # =========================
@@ -1430,10 +1451,9 @@ def api_admin_upload_update():
 
 
 # =========================
-# RUN (RENDER)
+# RUN (LOCAL ONLY)
 # =========================
 
 if __name__ == "__main__":
-    init_db()
-    port = int(os.environ.get("PORT", "5000"))  # Render sets PORT
+    port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
