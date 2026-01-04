@@ -26,14 +26,16 @@ from werkzeug.utils import secure_filename
 
 APP_SECRET = "super-secret-local-key"     # ⚠️ зміни
 ADMIN_PIN = "Dev1234"                     # ⚠️ зміни
-RUNNING_WINDOW_SEC = 90                  # heartbeat window (seconds)
+RUNNING_WINDOW_SEC = 90                   # heartbeat window (seconds)
 
-# Anti-flood: 1 activation log per key+hwid per N seconds
+# Anti-flood: 1 activation log per key+hwid per N seconds (для event='activation')
 ACTIVATION_LOG_COOLDOWN_SEC = 600         # 10 хв (постав 60 якщо хочеш 1/хв)
 
 # Optional Discord-bot hook (leave empty to disable)
 BOT_ACTIVATION_HOOK_URL = ""              # приклад: "https://YOUR-BOT.onrender.com/hook/activation"
 BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 # =========================
@@ -66,18 +68,22 @@ def healthz():
 
 
 # =========================
-# DB (SQLite only)
+# TIME / DB HELPERS
 # =========================
 
+def kyiv_now():
+    return datetime.now(KYIV_TZ)
+
 def now_value():
-    return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d %H:%M:%S")
+    # ✅ ЧИСТИЙ Київський час, БЕЗ +0200
+    return kyiv_now().strftime("%Y-%m-%d %H:%M:%S")
 
 def parse_dt(x):
     if not x:
         return None
-    s = str(x)
     try:
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        # stored as "YYYY-MM-DD HH:MM:SS"
+        return datetime.strptime(str(x), "%Y-%m-%d %H:%M:%S").replace(tzinfo=KYIV_TZ)
     except ValueError:
         return None
 
@@ -85,7 +91,7 @@ def is_expired_row(expires_at) -> bool:
     if not expires_at:
         return False
     dt = parse_dt(expires_at)
-    return bool(dt and datetime.now() > dt)
+    return bool(dt and kyiv_now() > dt)
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
@@ -111,6 +117,11 @@ def db_insert_returning_id(cur, sql: str, params=()):
     db_execute(cur, sql, params)
     return cur.lastrowid
 
+
+# =========================
+# INIT DB
+# =========================
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
@@ -131,6 +142,7 @@ def init_db():
     )
     """)
 
+    # ✅ activations + event
     db_execute(cur, """
     CREATE TABLE IF NOT EXISTS activations (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,9 +150,16 @@ def init_db():
         key_value       TEXT,
         hwid            TEXT,
         ip              TEXT,
+        event           TEXT,
         created_at      TEXT
     )
     """)
+
+    # ✅ якщо таблиця була стара без колонки event — додамо
+    try:
+        db_execute(cur, "ALTER TABLE activations ADD COLUMN event TEXT")
+    except sqlite3.OperationalError:
+        pass  # already exists
 
     db_execute(cur, """
     CREATE TABLE IF NOT EXISTS updates (
@@ -186,10 +205,11 @@ def init_db():
     try:
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
-        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_event ON activations(event)")
     except sqlite3.OperationalError:
         pass
 
@@ -289,7 +309,7 @@ def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
     dt = parse_dt(last_seen)
     if not dt:
         return False
-    return (datetime.now() - dt).total_seconds() <= window_sec
+    return (kyiv_now() - dt).total_seconds() <= window_sec
 
 
 # =========================
@@ -329,12 +349,12 @@ def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
 
 
 # =========================
-# ANTI-FLOOD (activations)
+# ANTI-FLOOD (event='activation')
 # =========================
 
 def should_log_activation(cur, key_value: str, hwid: str, cooldown_sec: int) -> bool:
     """
-    1 log per (key_value, hwid) per cooldown_sec
+    1 activation log per (key_value, hwid) per cooldown_sec
     """
     if cooldown_sec <= 0:
         return True
@@ -344,7 +364,7 @@ def should_log_activation(cur, key_value: str, hwid: str, cooldown_sec: int) -> 
         """
         SELECT created_at
         FROM activations
-        WHERE key_value=? AND hwid=?
+        WHERE key_value=? AND hwid=? AND event='activation'
         ORDER BY id DESC
         LIMIT 1
         """,
@@ -357,7 +377,7 @@ def should_log_activation(cur, key_value: str, hwid: str, cooldown_sec: int) -> 
     if not last_dt:
         return True
 
-    diff = (datetime.now() - last_dt).total_seconds()
+    diff = (kyiv_now() - last_dt).total_seconds()
     return diff >= float(cooldown_sec)
 
 
@@ -390,7 +410,6 @@ h1{
   letter-spacing:3px;
   text-shadow:0 0 18px #ff7b00;
 }
-/* NAV */
 .top-nav{
   max-width:1600px;
   margin:0 auto 16px;
@@ -424,7 +443,6 @@ h1{
   border-color:rgba(255,140,26,.14);
 }
 .nav-right{display:flex;gap:8px;flex-wrap:wrap}
-/* PANEL */
 .panel{
   max-width:1600px;
   margin:0 auto 40px;
@@ -465,7 +483,6 @@ input:focus,select:focus,textarea:focus{
   border-color:#ff8c1a;
   box-shadow:0 0 0 3px rgba(255,140,26,.15);
 }
-/* Buttons */
 button{
   border:1px solid transparent;
   border-radius:12px;
@@ -516,10 +533,9 @@ button:active{transform:translateY(1px) scale(.99)}
   transform:translateY(-1px);
   box-shadow:0 0 0 3px rgba(255,90,95,.12),0 18px 36px rgba(0,0,0,.35);
 }
-/* Table */
 table{
   width:100%;
-  min-width:1750px;
+  min-width:1400px;
   border-collapse:collapse;
   margin-top:10px;
   font-size:13px;
@@ -541,31 +557,7 @@ th{
 }
 tr:nth-child(even){background:#070b10}
 tr:hover{background:rgba(255,140,26,.06)}
-.tbl-input{
-  width:100%;
-  min-width:120px;
-  background:#020509;
-  border:1px solid #252a31;
-  border-radius:10px;
-  padding:8px 10px;
-  font-size:13px;
-  color:#f5f5f5;
-}
-.tbl-input.key{min-width:260px}
-.tbl-input.owner{min-width:200px}
-.tbl-input.note{min-width:240px}
-.tbl-input.hwid{min-width:320px}
-.tbl-input.expires{min-width:200px}
-.tbl-checkbox{display:flex;justify-content:center;align-items:center}
-/* Actions */
-.actions{
-  display:flex;
-  flex-direction:column;
-  gap:6px;
-  min-width:150px;
-}
-.actions form{margin:0}
-/* Badges */
+.actions{display:flex;gap:8px;flex-wrap:wrap}
 .badge{
   display:inline-flex;
   align-items:center;
@@ -721,7 +713,7 @@ def page_keys():
 
   <div class="section-title">Ключі</div>
 
-  <table>
+  <table style="min-width:1750px;">
     <tr>
       <th style="width:70px;">ID</th>
       <th style="width:320px;">Key</th>
@@ -734,7 +726,7 @@ def page_keys():
       <th style="width:220px;">Expires</th>
       <th style="width:360px;">HWID</th>
       <th style="width:200px;">Last seen</th>
-      <th style="width:180px;">Дії</th>
+      <th style="width:220px;">Дії</th>
     </tr>
 
     {{% for k in keys %}}
@@ -744,7 +736,7 @@ def page_keys():
       <td>{{{{k.id}}}}</td>
 
       <td>
-        <input class="tbl-input key" name="key_value" form="f{{{{k.id}}}}" value="{{{{k.key_value}}}}">
+        <input class="tbl-input" style="min-width:260px;" name="key_value" form="f{{{{k.id}}}}" value="{{{{k.key_value}}}}">
       </td>
 
       <td>
@@ -755,37 +747,24 @@ def page_keys():
         {{% endif %}}
       </td>
 
-      <td>
-        <input class="tbl-input owner" name="owner" form="f{{{{k.id}}}}" value="{{{{k.owner or ''}}}}">
-      </td>
+      <td><input class="tbl-input" style="min-width:200px;" name="owner" form="f{{{{k.id}}}}" value="{{{{k.owner or ''}}}}"></td>
+      <td><input class="tbl-input" style="min-width:240px;" name="note" form="f{{{{k.id}}}}" value="{{{{k.note or ''}}}}"></td>
 
-      <td>
-        <input class="tbl-input note" name="note" form="f{{{{k.id}}}}" value="{{{{k.note or ''}}}}">
-      </td>
-
-      <td class="tbl-checkbox">
+      <td style="text-align:center;">
         <input type="checkbox" name="is_active" value="1" form="f{{{{k.id}}}}" {{% if k.is_active %}}checked{{% endif %}}>
       </td>
 
-      <td class="tbl-checkbox">
+      <td style="text-align:center;">
         <input type="checkbox" name="is_banned" value="1" form="f{{{{k.id}}}}" {{% if k.is_banned %}}checked{{% endif %}}>
       </td>
 
-      <td>
-        <input class="tbl-input" name="ban_reason" form="f{{{{k.id}}}}" value="{{{{k.ban_reason or ''}}}}">
-      </td>
+      <td><input class="tbl-input" name="ban_reason" form="f{{{{k.id}}}}" value="{{{{k.ban_reason or ''}}}}"></td>
 
-      <td>
-        <input class="tbl-input expires" name="expires_at" form="f{{{{k.id}}}}" placeholder="YYYY-MM-DD HH:MM:SS" value="{{{{k.expires_at or ''}}}}">
-      </td>
+      <td><input class="tbl-input" style="min-width:200px;" name="expires_at" form="f{{{{k.id}}}}" placeholder="YYYY-MM-DD HH:MM:SS" value="{{{{k.expires_at or ''}}}}"></td>
 
-      <td>
-        <input class="tbl-input hwid" name="hwid" form="f{{{{k.id}}}}" value="{{{{k.hwid or ''}}}}">
-      </td>
+      <td><input class="tbl-input" style="min-width:320px;" name="hwid" form="f{{{{k.id}}}}" value="{{{{k.hwid or ''}}}}"></td>
 
-      <td style="font-size:12px;color:#ddd;">
-        {{{{k.last_seen or ''}}}}
-      </td>
+      <td style="font-size:12px;color:#ddd;">{{{{k.last_seen or ''}}}}</td>
 
       <td>
         <div class="actions">
@@ -834,18 +813,18 @@ def page_activations():
         rows = db_fetchall(
             cur,
             """
-            SELECT id, key_value, hwid, ip, created_at
+            SELECT id, event, key_value, hwid, ip, created_at
             FROM activations
-            WHERE key_value LIKE ? OR hwid LIKE ? OR ip LIKE ?
+            WHERE key_value LIKE ? OR hwid LIKE ? OR ip LIKE ? OR event LIKE ?
             ORDER BY id DESC
             LIMIT ?
             """,
-            (pat, pat, pat, limit),
+            (pat, pat, pat, pat, limit),
         )
     else:
         rows = db_fetchall(
             cur,
-            "SELECT id, key_value, hwid, ip, created_at FROM activations ORDER BY id DESC LIMIT ?",
+            "SELECT id, event, key_value, hwid, ip, created_at FROM activations ORDER BY id DESC LIMIT ?",
             (limit,),
         )
     conn.close()
@@ -859,29 +838,37 @@ def page_activations():
 <h1>FARMBOT PANEL</h1>
 {nav_html('activations')}
 <div class="panel">
-  <div class="section-title">Активації</div>
+  <div class="section-title">Активації / Входи лаунчера</div>
 
   <form method="get" action="/activations">
     <div class="form-row">
       <label>Пошук</label>
-      <input name="q" value="{{{{q}}}}" placeholder="key / hwid / ip" style="min-width:320px;">
+      <input name="q" value="{{{{q}}}}" placeholder="key / hwid / ip / event" style="min-width:320px;">
       <label>Ліміт</label>
       <input type="number" name="limit" min="50" max="5000" value="{{{{limit}}}}" style="max-width:140px;">
       <button class="btn-main btn-small" type="submit">Показати</button>
     </div>
   </form>
 
-  <table style="min-width:1200px;">
+  <form method="post" action="/activations/clear" onsubmit="return confirm('Очистити всі логи активацій?');">
+    <div class="form-row">
+      <button class="btn-danger btn-small" type="submit">Очистити логи</button>
+    </div>
+  </form>
+
+  <table style="min-width:1400px;">
     <tr>
       <th style="width:80px;">ID</th>
+      <th style="width:140px;">Event</th>
       <th style="width:320px;">Key</th>
       <th style="width:420px;">HWID</th>
       <th style="width:220px;">IP</th>
-      <th style="width:220px;">Дата</th>
+      <th style="width:220px;">Дата (Kyiv)</th>
     </tr>
     {{% for a in rows %}}
     <tr>
       <td>{{{{a.id}}}}</td>
+      <td>{{{{a.event or ''}}}}</td>
       <td>{{{{a.key_value}}}}</td>
       <td>{{{{a.hwid or ''}}}}</td>
       <td>{{{{a.ip or ''}}}}</td>
@@ -893,6 +880,17 @@ def page_activations():
 </body></html>
 """
     return render_template_string(html, base_css=BASE_CSS, rows=rows, q=q, limit=limit)
+
+@app.route("/activations/clear", methods=["POST"])
+@login_required
+def activations_clear():
+    conn = get_db()
+    cur = conn.cursor()
+    db_execute(cur, "DELETE FROM activations")
+    conn.commit()
+    conn.close()
+    log_action("panel", "clear_activations", None, None, "deleted all activation logs")
+    return redirect("/activations")
 
 @app.route("/launcher_logs")
 @login_required
@@ -942,7 +940,7 @@ def page_launcher_logs():
 <h1>FARMBOT PANEL</h1>
 {nav_html('launcher')}
 <div class="panel">
-  <div class="section-title">Логи лаунчера</div>
+  <div class="section-title">Логи лаунчера (admin_logs)</div>
 
   <form method="get" action="/launcher_logs">
     <div class="form-row">
@@ -957,7 +955,7 @@ def page_launcher_logs():
   <table style="min-width:1500px;">
     <tr>
       <th style="width:90px;">ID</th>
-      <th style="width:220px;">Дата</th>
+      <th style="width:220px;">Дата (Kyiv)</th>
       <th style="width:220px;">Event</th>
       <th style="width:360px;">Key</th>
       <th>Details</th>
@@ -1037,7 +1035,7 @@ def page_updates():
   <table style="min-width:1400px;">
     <tr>
       <th style="width:90px;">ID</th>
-      <th style="width:240px;">Дата</th>
+      <th style="width:240px;">Дата (Kyiv)</th>
       <th style="width:380px;">Файл</th>
       <th style="width:160px;">Версія</th>
       <th style="width:160px;">Розмір (MB)</th>
@@ -1138,7 +1136,7 @@ def gen_keys():
     created_at = now_value()
     expires_at = None
     if days > 0:
-        expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        expires_at = (kyiv_now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
     cur = conn.cursor()
@@ -1316,7 +1314,9 @@ def api_status():
         "maintenance_message": sd.get("maintenance_message") or ""
     })
 
-# ✅ check_key + anti-flood activations
+# ✅ check_key:
+# - якщо ключ валідний -> ЗАВЖДИ пишемо event='enter' в activations (вхід лаунчера)
+# - додатково (антифлуд) event='activation' раз на cooldown
 @app.route("/api/check_key", methods=["POST"])
 def api_check_key():
     guard = maintenance_guard()
@@ -1365,27 +1365,33 @@ def api_check_key():
             conn.close()
             return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
-    # anti-flood log
+    # ✅ 1) ЛОГ КОЖНОГО ВХОДУ (видно на /activations)
+    db_execute(
+        cur,
+        "INSERT INTO activations (key_id, key_value, hwid, ip, event, created_at) VALUES (?,?,?,?,?,?)",
+        (row["id"], row["key_value"], hwid, ip, "enter", nowv),
+    )
+
+    # ✅ 2) Анти-флуд лог "activation" (опціонально)
     do_log = should_log_activation(cur, row["key_value"], hwid, ACTIVATION_LOG_COOLDOWN_SEC)
     if do_log:
         db_execute(
             cur,
-            "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
-            (row["id"], row["key_value"], hwid, ip, nowv),
+            "INSERT INTO activations (key_id, key_value, hwid, ip, event, created_at) VALUES (?,?,?,?,?,?)",
+            (row["id"], row["key_value"], hwid, ip, "activation", nowv),
         )
 
     conn.commit()
     conn.close()
 
-    # ✅ discord hook: send only when actually logged (no flood)
-    # and only on first activation (як ти хотів)
+    # ✅ discord hook (по бажанню) — тільки якщо перша активація + антифлуд спрацював
     if do_log and first_activation:
         try:
             notify_bot_activation(key_value=row["key_value"], hwid=hwid, ip=ip, created_at=nowv)
         except Exception:
             pass
 
-    return jsonify({"ok": True, "reason": "ok", "logged": bool(do_log), "first": bool(first_activation)})
+    return jsonify({"ok": True, "reason": "ok", "enter_logged": True, "activation_logged": bool(do_log), "first": bool(first_activation)})
 
 @app.route("/api/heartbeat", methods=["POST"])
 def api_heartbeat():
@@ -1521,7 +1527,7 @@ def api_ds_key_create():
     created_at = now_value()
     expires_at = None
     if days > 0:
-        expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        expires_at = (kyiv_now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
     cur = conn.cursor()
