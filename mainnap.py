@@ -5,7 +5,8 @@ import json
 import sqlite3
 import secrets
 import string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from functools import wraps
 
 from flask import (
@@ -64,6 +65,7 @@ app.secret_key = os.environ.get("APP_SECRET", "super-secret-local-key")
 ADMIN_PIN = os.environ.get("ADMIN_PIN", "Dev1234")
 RUNNING_WINDOW_SEC = int(os.environ.get("RUNNING_WINDOW_SEC", "90"))  # heartbeat window
 
+
 # =========================
 # HEALTH CHECK ENDPOINT
 # =========================
@@ -73,10 +75,41 @@ def healthz():
 
 
 # =========================
-# DB
+# DB (SQLite local / Postgres Neon)
 # =========================
 
+def using_postgres() -> bool:
+    return bool((os.environ.get("DATABASE_URL") or "").strip())
+
+
+def now_str():
+    # Kyiv time string (for UI / sqlite)
+    return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def db_bool(v: bool):
+    # Postgres: bool, SQLite: 0/1
+    if using_postgres():
+        return bool(v)
+    return 1 if v else 0
+
+
 def get_db():
+    """
+    If DATABASE_URL exists -> Postgres (Neon)
+    else -> SQLite (local)
+    """
+    if using_postgres():
+        import psycopg
+        from psycopg.rows import dict_row
+
+        conn = psycopg.connect(
+            os.environ["DATABASE_URL"],
+            row_factory=dict_row,   # rows like dict (similar to sqlite3.Row)
+            autocommit=False,
+        )
+        return conn
+
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON;")
@@ -86,86 +119,202 @@ def get_db():
     return conn
 
 
+def db_execute(cur, sql: str, params=()):
+    """
+    You use '?' placeholders everywhere (SQLite style).
+    psycopg uses '%s'. Convert automatically for Postgres.
+    """
+    if using_postgres():
+        sql = sql.replace("?", "%s")
+    return cur.execute(sql, params)
+
+
+def db_fetchone(cur, sql: str, params=()):
+    db_execute(cur, sql, params)
+    return cur.fetchone()
+
+
+def db_fetchall(cur, sql: str, params=()):
+    db_execute(cur, sql, params)
+    return cur.fetchall()
+
+
+def db_insert_returning_id(cur, sql: str, params=()):
+    """
+    SQLite: cur.lastrowid
+    Postgres: RETURNING id
+    """
+    if using_postgres():
+        sql = sql.strip().rstrip(";")
+        if "returning" not in sql.lower():
+            sql += " RETURNING id"
+        db_execute(cur, sql, params)
+        row = cur.fetchone()
+        return (row or {}).get("id")
+    else:
+        db_execute(cur, sql, params)
+        return cur.lastrowid
+
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS keys (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        key_value   TEXT NOT NULL UNIQUE,
-        owner       TEXT,
-        note        TEXT,
-        is_active   INTEGER NOT NULL DEFAULT 1,
-        is_banned   INTEGER NOT NULL DEFAULT 0,
-        ban_reason  TEXT,
-        created_at  TEXT,
-        expires_at  TEXT,
-        hwid        TEXT,
-        last_seen   TEXT
-    )
-    """)
+    if using_postgres():
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS keys (
+            id           SERIAL PRIMARY KEY,
+            key_value    TEXT NOT NULL UNIQUE,
+            owner        TEXT,
+            note         TEXT,
+            is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+            is_banned    BOOLEAN NOT NULL DEFAULT FALSE,
+            ban_reason   TEXT,
+            created_at   TIMESTAMPTZ DEFAULT NOW(),
+            expires_at   TIMESTAMPTZ,
+            hwid         TEXT,
+            last_seen    TIMESTAMPTZ
+        );
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS activations (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        key_id          INTEGER,
-        key_value       TEXT,
-        hwid            TEXT,
-        ip              TEXT,
-        created_at      TEXT
-    )
-    """)
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS activations (
+            id          SERIAL PRIMARY KEY,
+            key_id      INTEGER,
+            key_value   TEXT,
+            hwid        TEXT,
+            ip          TEXT,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS updates (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename    TEXT,
-        stored_path TEXT,
-        version     TEXT,
-        note        TEXT,
-        uploaded_at TEXT,
-        size_bytes  INTEGER
-    )
-    """)
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS updates (
+            id          SERIAL PRIMARY KEY,
+            filename    TEXT,
+            stored_path TEXT,
+            version     TEXT,
+            note        TEXT,
+            uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+            size_bytes  BIGINT
+        );
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS admin_logs (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        actor       TEXT,
-        action      TEXT,
-        key_id      INTEGER,
-        key_value   TEXT,
-        details     TEXT,
-        ip          TEXT,
-        created_at  TEXT
-    )
-    """)
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id         SERIAL PRIMARY KEY,
+            actor      TEXT,
+            action     TEXT,
+            key_id     INTEGER,
+            key_value  TEXT,
+            details    TEXT,
+            ip         TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS app_settings (
-        id                  INTEGER PRIMARY KEY CHECK (id = 1),
-        maintenance_enabled INTEGER NOT NULL DEFAULT 0,
-        maintenance_message TEXT
-    )
-    """)
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            id                  INTEGER PRIMARY KEY,
+            maintenance_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            maintenance_message TEXT
+        );
+        """)
 
-    cur.execute("SELECT COUNT(*) AS c FROM app_settings")
-    if cur.fetchone()["c"] == 0:
-        cur.execute(
-            "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, 0, ?)",
-            ("Тех роботи. Спробуй пізніше.",),
+        row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM app_settings WHERE id=1")
+        c = row["c"] if row else 0
+        if c == 0:
+            db_execute(
+                cur,
+                "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, FALSE, ?)",
+                ("Тех роботи. Спробуй пізніше.",),
+            )
+
+        # indexes
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
+
+    else:
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS keys (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_value   TEXT NOT NULL UNIQUE,
+            owner       TEXT,
+            note        TEXT,
+            is_active   INTEGER NOT NULL DEFAULT 1,
+            is_banned   INTEGER NOT NULL DEFAULT 0,
+            ban_reason  TEXT,
+            created_at  TEXT,
+            expires_at  TEXT,
+            hwid        TEXT,
+            last_seen   TEXT
         )
+        """)
 
-    # indexes
-    try:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
-    except sqlite3.OperationalError:
-        pass
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS activations (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id          INTEGER,
+            key_value       TEXT,
+            hwid            TEXT,
+            ip              TEXT,
+            created_at      TEXT
+        )
+        """)
+
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS updates (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename    TEXT,
+            stored_path TEXT,
+            version     TEXT,
+            note        TEXT,
+            uploaded_at TEXT,
+            size_bytes  INTEGER
+        )
+        """)
+
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor       TEXT,
+            action      TEXT,
+            key_id      INTEGER,
+            key_value   TEXT,
+            details     TEXT,
+            ip          TEXT,
+            created_at  TEXT
+        )
+        """)
+
+        db_execute(cur, """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            id                  INTEGER PRIMARY KEY CHECK (id = 1),
+            maintenance_enabled INTEGER NOT NULL DEFAULT 0,
+            maintenance_message TEXT
+        )
+        """)
+
+        row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM app_settings")
+        if (row["c"] if row else 0) == 0:
+            db_execute(
+                cur,
+                "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, 0, ?)",
+                ("Тех роботи. Спробуй пізніше.",),
+            )
+
+        # indexes
+        try:
+            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
+            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
+            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
+            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
+            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
+        except sqlite3.OperationalError:
+            pass
 
     conn.commit()
     conn.close()
@@ -184,22 +333,35 @@ def rand_key(prefix="FARM-"):
     return prefix + "".join(secrets.choice(abc) for _ in range(16))
 
 
-def parse_dt(s):
-    if not s:
+def parse_dt(x):
+    if not x:
         return None
+
+    # Postgres can return datetime
+    if hasattr(x, "timestamp"):
+        return x
+
+    s = str(x)
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
 
 
+def is_expired_row(expires_at) -> bool:
+    if not expires_at:
+        return False
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # datetime (Postgres)
+    if hasattr(expires_at, "timestamp"):
+        now_utc = datetime.now(timezone.utc)
+        try:
+            return expires_at < now_utc
+        except Exception:
+            return False
 
-
-def is_expired_row(expires_at: str) -> bool:
-    dt = parse_dt(expires_at or "")
+    # SQLite string
+    dt = parse_dt(expires_at)
     return bool(dt and datetime.now() > dt)
 
 
@@ -217,21 +379,40 @@ def get_client_ip():
 def log_action(actor, action, key_id=None, key_value=None, details=None):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO admin_logs (actor, action, key_id, key_value, details, ip, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            actor,
-            action,
-            key_id,
-            key_value,
-            details,
-            get_client_ip(),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ),
-    )
+    # created_at: SQLite -> string, Postgres -> default NOW()
+    if using_postgres():
+        db_execute(
+            cur,
+            """
+            INSERT INTO admin_logs (actor, action, key_id, key_value, details, ip)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                actor,
+                action,
+                key_id,
+                key_value,
+                details,
+                get_client_ip(),
+            ),
+        )
+    else:
+        db_execute(
+            cur,
+            """
+            INSERT INTO admin_logs (actor, action, key_id, key_value, details, ip, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                actor,
+                action,
+                key_id,
+                key_value,
+                details,
+                get_client_ip(),
+                now_str(),
+            ),
+        )
     conn.commit()
     conn.close()
 
@@ -246,7 +427,7 @@ def api_require_admin_pin():
 def get_settings():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM app_settings WHERE id=1")
+    db_execute(cur, "SELECT * FROM app_settings WHERE id=1")
     s = cur.fetchone()
     conn.close()
     return s
@@ -260,10 +441,14 @@ def maintenance_guard():
     return None
 
 
-def is_running(last_seen_str: str, window_sec=RUNNING_WINDOW_SEC) -> bool:
-    dt = parse_dt(last_seen_str or "")
+def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
+    dt = parse_dt(last_seen)
     if not dt:
         return False
+
+    if getattr(dt, "tzinfo", None) is not None:
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= window_sec
+
     return (datetime.now() - dt).total_seconds() <= window_sec
 
 
@@ -605,13 +790,19 @@ def logout():
 def page_keys():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM keys ORDER BY id DESC")
+    db_execute(cur, "SELECT * FROM keys ORDER BY id DESC")
     keys_rows = cur.fetchall()
     conn.close()
 
     keys_view = []
     for k in keys_rows:
         d = dict(k)
+
+        # Postgres datetimes -> strings for UI safety
+        d["created_at"] = str(d.get("created_at") or "")
+        d["expires_at"] = str(d.get("expires_at") or "")
+        d["last_seen"] = str(d.get("last_seen") or "")
+
         d["running"] = is_running(d.get("last_seen") or "", RUNNING_WINDOW_SEC)
         keys_view.append(d)
 
@@ -751,7 +942,8 @@ def page_activations():
     cur = conn.cursor()
     if q:
         pat = f"%{q}%"
-        cur.execute(
+        db_execute(
+            cur,
             """
             SELECT id, key_value, hwid, ip, created_at
             FROM activations
@@ -762,7 +954,8 @@ def page_activations():
             (pat, pat, pat, limit),
         )
     else:
-        cur.execute(
+        db_execute(
+            cur,
             "SELECT id, key_value, hwid, ip, created_at FROM activations ORDER BY id DESC LIMIT ?",
             (limit,),
         )
@@ -828,7 +1021,8 @@ def page_launcher_logs():
     cur = conn.cursor()
     if q:
         pat = f"%{q}%"
-        cur.execute(
+        db_execute(
+            cur,
             """
             SELECT id, action, key_value, details, ip, created_at
             FROM admin_logs
@@ -839,7 +1033,8 @@ def page_launcher_logs():
             (pat, pat, pat, pat, limit),
         )
     else:
-        cur.execute(
+        db_execute(
+            cur,
             """
             SELECT id, action, key_value, details, ip, created_at
             FROM admin_logs
@@ -908,7 +1103,8 @@ def page_updates():
     cur = conn.cursor()
     if q:
         pat = f"%{q}%"
-        cur.execute(
+        db_execute(
+            cur,
             """
             SELECT * FROM updates
             WHERE filename LIKE ? OR version LIKE ? OR note LIKE ?
@@ -918,7 +1114,7 @@ def page_updates():
             (pat, pat, pat),
         )
     else:
-        cur.execute("SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 300")
+        db_execute(cur, "SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 300")
     rows = cur.fetchall()
     conn.close()
 
@@ -985,21 +1181,22 @@ def page_updates():
 @login_required
 def page_settings():
     if request.method == "POST":
-        enabled = 1 if (request.form.get("maintenance_enabled") == "1") else 0
+        enabled = True if (request.form.get("maintenance_enabled") == "1") else False
         msg = (request.form.get("maintenance_message") or "").strip()
         if not msg:
             msg = "Тех роботи. Спробуй пізніше."
 
         conn = get_db()
         cur = conn.cursor()
-        cur.execute(
+        db_execute(
+            cur,
             "UPDATE app_settings SET maintenance_enabled=?, maintenance_message=? WHERE id=1",
-            (enabled, msg),
+            (db_bool(enabled), msg),
         )
         conn.commit()
         conn.close()
 
-        log_action("panel", "set_maintenance", None, None, f"enabled={enabled}")
+        log_action("panel", "set_maintenance", None, None, f"enabled={int(enabled)}")
         return redirect("/settings")
 
     s = get_settings()
@@ -1072,13 +1269,24 @@ def gen_keys():
     for _ in range(count):
         key_value = rand_key(prefix)
         try:
-            cur.execute(
-                "INSERT INTO keys (key_value, is_active, is_banned, created_at, expires_at) VALUES (?,1,0,?,?)",
-                (key_value, created_at, expires_at),
-            )
+            if using_postgres():
+                # store created_at/expires_at as timestamptz if provided; easiest: pass strings and let PG cast if needed
+                db_execute(
+                    cur,
+                    "INSERT INTO keys (key_value, is_active, is_banned, created_at, expires_at) VALUES (?, ?, ?, NOW(), ?)",
+                    (key_value, db_bool(True), db_bool(False), expires_at),
+                )
+            else:
+                db_execute(
+                    cur,
+                    "INSERT INTO keys (key_value, is_active, is_banned, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                    (key_value, 1, 0, created_at, expires_at),
+                )
             made += 1
-        except sqlite3.IntegrityError:
+        except Exception:
+            # unique collision, ignore
             pass
+
     conn.commit()
     conn.close()
 
@@ -1097,19 +1305,35 @@ def key_update(key_id):
     expires_at = (f.get("expires_at") or "").strip()
     hwid = (f.get("hwid") or "").strip()
 
-    is_active = 1 if f.get("is_active") == "1" else 0
-    is_banned = 1 if f.get("is_banned") == "1" else 0
+    is_active = True if f.get("is_active") == "1" else False
+    is_banned = True if f.get("is_banned") == "1" else False
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE keys
-        SET key_value=?, owner=?, note=?, is_active=?, is_banned=?, ban_reason=?, expires_at=?, hwid=?
-        WHERE id=?
-        """,
-        (key_value, owner, note, is_active, is_banned, ban_reason, expires_at, hwid, key_id),
-    )
+
+    if using_postgres():
+        # if expires_at is empty string, set NULL
+        expires_param = expires_at if expires_at else None
+        db_execute(
+            cur,
+            """
+            UPDATE keys
+            SET key_value=?, owner=?, note=?, is_active=?, is_banned=?, ban_reason=?, expires_at=?, hwid=?
+            WHERE id=?
+            """,
+            (key_value, owner, note, db_bool(is_active), db_bool(is_banned), ban_reason or None, expires_param, hwid or None, key_id),
+        )
+    else:
+        db_execute(
+            cur,
+            """
+            UPDATE keys
+            SET key_value=?, owner=?, note=?, is_active=?, is_banned=?, ban_reason=?, expires_at=?, hwid=?
+            WHERE id=?
+            """,
+            (key_value, owner, note, 1 if is_active else 0, 1 if is_banned else 0, ban_reason, expires_at, hwid, key_id),
+        )
+
     conn.commit()
     conn.close()
 
@@ -1122,11 +1346,11 @@ def key_update(key_id):
 def key_ban(key_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT key_value FROM keys WHERE id=?", (key_id,))
+    db_execute(cur, "SELECT key_value FROM keys WHERE id=?", (key_id,))
     row = cur.fetchone()
     key_val = row["key_value"] if row else None
 
-    cur.execute("UPDATE keys SET is_banned=1, ban_reason='panel ban' WHERE id=?", (key_id,))
+    db_execute(cur, "UPDATE keys SET is_banned=?, ban_reason=? WHERE id=?", (db_bool(True), "panel ban", key_id))
     conn.commit()
     conn.close()
 
@@ -1139,11 +1363,11 @@ def key_ban(key_id):
 def key_unban(key_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT key_value FROM keys WHERE id=?", (key_id,))
+    db_execute(cur, "SELECT key_value FROM keys WHERE id=?", (key_id,))
     row = cur.fetchone()
     key_val = row["key_value"] if row else None
 
-    cur.execute("UPDATE keys SET is_banned=0, ban_reason=NULL WHERE id=?", (key_id,))
+    db_execute(cur, "UPDATE keys SET is_banned=?, ban_reason=NULL WHERE id=?", (db_bool(False), key_id))
     conn.commit()
     conn.close()
 
@@ -1156,11 +1380,11 @@ def key_unban(key_id):
 def key_clear_hwid(key_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT key_value FROM keys WHERE id=?", (key_id,))
+    db_execute(cur, "SELECT key_value FROM keys WHERE id=?", (key_id,))
     row = cur.fetchone()
     key_val = row["key_value"] if row else None
 
-    cur.execute("UPDATE keys SET hwid=NULL WHERE id=?", (key_id,))
+    db_execute(cur, "UPDATE keys SET hwid=NULL WHERE id=?", (key_id,))
     conn.commit()
     conn.close()
 
@@ -1173,11 +1397,11 @@ def key_clear_hwid(key_id):
 def key_delete(key_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT key_value FROM keys WHERE id=?", (key_id,))
+    db_execute(cur, "SELECT key_value FROM keys WHERE id=?", (key_id,))
     row = cur.fetchone()
     key_val = row["key_value"] if row else None
 
-    cur.execute("DELETE FROM keys WHERE id=?", (key_id,))
+    db_execute(cur, "DELETE FROM keys WHERE id=?", (key_id,))
     deleted = cur.rowcount
     conn.commit()
     conn.close()
@@ -1205,11 +1429,20 @@ def upload_update():
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO updates (filename, stored_path, version, note, uploaded_at, size_bytes) VALUES (?,?,?,?,?,?)",
-        (safe_name, stored_name, version, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), size_bytes),
-    )
-    new_id = cur.lastrowid
+
+    if using_postgres():
+        new_id = db_insert_returning_id(
+            cur,
+            "INSERT INTO updates (filename, stored_path, version, note, size_bytes) VALUES (?, ?, ?, ?, ?)",
+            (safe_name, stored_name, version, note, size_bytes),
+        )
+    else:
+        new_id = db_insert_returning_id(
+            cur,
+            "INSERT INTO updates (filename, stored_path, version, note, uploaded_at, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+            (safe_name, stored_name, version, note, now_str(), size_bytes),
+        )
+
     conn.commit()
     conn.close()
 
@@ -1222,7 +1455,7 @@ def upload_update():
 def download_latest():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 1")
+    db_execute(cur, "SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 1")
     row = cur.fetchone()
     conn.close()
 
@@ -1266,7 +1499,7 @@ def api_check_key():
 
   conn = get_db()
   cur = conn.cursor()
-  cur.execute("SELECT * FROM keys WHERE key_value=?", (key_value,))
+  db_execute(cur, "SELECT * FROM keys WHERE key_value=?", (key_value,))
   row = cur.fetchone()
 
   if not row:
@@ -1281,22 +1514,28 @@ def api_check_key():
     conn.close()
     return jsonify({"ok": False, "reason": "banned"})
 
-  if is_expired_row(row["expires_at"]):
+  if is_expired_row(row.get("expires_at")):
     conn.close()
     return jsonify({"ok": False, "reason": "expired"})
 
-  saved_hwid = (row["hwid"] or "").strip()
-  now = now_str()
+  saved_hwid = (row.get("hwid") or "").strip()
 
-  # ❗ АКТИВАЦІЯ ТІЛЬКИ 1 РАЗ
+  # ✅ activation only once
   if not saved_hwid:
-    cur.execute("UPDATE keys SET hwid=? WHERE id=?",
-          (hwid, row["id"]))
+    db_execute(cur, "UPDATE keys SET hwid=? WHERE id=?", (hwid, row["id"]))
 
-    cur.execute(
-      "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
-      (row["id"], row["key_value"], hwid, get_client_ip(), now),
-    )
+    if using_postgres():
+      db_execute(
+        cur,
+        "INSERT INTO activations (key_id, key_value, hwid, ip) VALUES (?, ?, ?, ?)",
+        (row["id"], row["key_value"], hwid, get_client_ip()),
+      )
+    else:
+      db_execute(
+        cur,
+        "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?, ?, ?, ?, ?)",
+        (row["id"], row["key_value"], hwid, get_client_ip(), now_str()),
+      )
   else:
     if saved_hwid != hwid:
       conn.close()
@@ -1322,25 +1561,27 @@ def api_heartbeat():
 
   conn = get_db()
   cur = conn.cursor()
-  cur.execute("SELECT * FROM keys WHERE key_value=?", (key_value,))
+  db_execute(cur, "SELECT * FROM keys WHERE key_value=?", (key_value,))
   row = cur.fetchone()
 
   if not row:
     conn.close()
     return jsonify({"ok": False, "reason": "not_found"})
 
-  if row["hwid"] and row["hwid"] != hwid:
+  if row.get("hwid") and row.get("hwid") != hwid:
     conn.close()
     return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
-  if row["is_banned"] or not row["is_active"] or is_expired_row(row["expires_at"]):
+  if row.get("is_banned") or (not row.get("is_active")) or is_expired_row(row.get("expires_at")):
     conn.close()
     return jsonify({"ok": False, "reason": "inactive"})
 
-  cur.execute(
-    "UPDATE keys SET last_seen=? WHERE id=?",
-    (now_str(), row["id"])
-  )
+  # only heartbeat updates last_seen
+  if using_postgres():
+    db_execute(cur, "UPDATE keys SET last_seen=NOW() WHERE id=?", (row["id"],))
+  else:
+    db_execute(cur, "UPDATE keys SET last_seen=? WHERE id=?", (now_str(), row["id"]))
+
   conn.commit()
   conn.close()
   return jsonify({"ok": True})
@@ -1387,7 +1628,7 @@ def api_updates_latest():
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 1")
+    db_execute(cur, "SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 1")
     row = cur.fetchone()
     conn.close()
 
@@ -1397,11 +1638,11 @@ def api_updates_latest():
     return jsonify({
         "ok": True,
         "id": row["id"],
-        "version": row["version"] or "",
-        "note": row["note"] or "",
-        "filename": row["filename"] or "",
-        "size_bytes": row["size_bytes"] or 0,
-        "uploaded_at": row["uploaded_at"] or ""
+        "version": row.get("version") or "",
+        "note": row.get("note") or "",
+        "filename": row.get("filename") or "",
+        "size_bytes": row.get("size_bytes") or 0,
+        "uploaded_at": str(row.get("uploaded_at") or "")
     })
 
 
@@ -1413,7 +1654,7 @@ def api_updates_latest_download():
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 1")
+    db_execute(cur, "SELECT * FROM updates ORDER BY uploaded_at DESC, id DESC LIMIT 1")
     row = cur.fetchone()
     conn.close()
 
@@ -1454,11 +1695,20 @@ def api_admin_upload_update():
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO updates (filename, stored_path, version, note, uploaded_at, size_bytes) VALUES (?,?,?,?,?,?)",
-        (safe_name, stored_name, version, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), size_bytes),
-    )
-    new_id = cur.lastrowid
+
+    if using_postgres():
+        new_id = db_insert_returning_id(
+            cur,
+            "INSERT INTO updates (filename, stored_path, version, note, size_bytes) VALUES (?, ?, ?, ?, ?)",
+            (safe_name, stored_name, version, note, size_bytes),
+        )
+    else:
+        new_id = db_insert_returning_id(
+            cur,
+            "INSERT INTO updates (filename, stored_path, version, note, uploaded_at, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+            (safe_name, stored_name, version, note, now_str(), size_bytes),
+        )
+
     conn.commit()
     conn.close()
 
