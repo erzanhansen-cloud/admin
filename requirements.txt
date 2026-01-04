@@ -2,5 +2,6 @@ flask
 werkzeug
 gunicorn
 psycopg[binary]
-psycopg[binary]==3.2.1
+psycopg-binary==3.2.2
+
 
