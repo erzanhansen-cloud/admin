@@ -119,7 +119,7 @@ def split_pg_url_and_opts(url: str):
 def now_value():
     """
     Для Postgres: datetime (UTC)
-    Для SQLite: string (Kyiv time) — як у тебе було
+    Для SQLite: string (Kyiv time)
     """
     if using_postgres():
         return datetime.now(timezone.utc)
@@ -204,10 +204,6 @@ def db_fetchone(cur, sql: str, params=()):
 def db_fetchall(cur, sql: str, params=()):
     db_execute(cur, sql, params)
     return cur.fetchall()
-
-def db_lastrowid(cur):
-    # psycopg не має lastrowid як sqlite
-    return getattr(cur, "lastrowid", None)
 
 def db_insert_returning_id(cur, sql: str, params=()):
     """
@@ -386,7 +382,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 # IMPORTANT: init db even when not running __main__ (gunicorn)
 init_db()
 
@@ -444,12 +439,74 @@ def get_settings():
     conn.close()
     return s
 
+# ---------- FIXED maintenance_guard ----------
 def maintenance_guard():
     s = get_settings()
-    if s and int(s["maintenance_enabled"] or 0) == 1:
-        msg = s["maintenance_message"] or "Тех роботи. Спробуй пізніше."
+    if not s:
+        return None
+
+    sd = dict(s)  # sqlite Row або pg dict_row -> dict
+    enabled_raw = sd.get("maintenance_enabled")
+
+    # SQLite: 0/1, Postgres: True/False
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    else:
+        enabled = int(enabled_raw or 0) == 1
+
+    if enabled:
+        msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
         return jsonify({"ok": False, "reason": "maintenance", "message": msg}), 503
+
     return None
+
+# ---------- GLOBAL maintenance (closes host) ----------
+@app.before_request
+def global_maintenance():
+    # static завжди доступний
+    if request.endpoint == "static":
+        return None
+
+    ep = request.endpoint or ""
+
+    # whitelist: можна зайти і вимкнути тех-режим
+    allowed = {"healthz", "login", "logout", "page_settings"}
+    if ep in allowed:
+        return None
+
+    s = get_settings()
+    if not s:
+        return None
+
+    sd = dict(s)
+    enabled_raw = sd.get("maintenance_enabled")
+
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    else:
+        enabled = int(enabled_raw or 0) == 1
+
+    if not enabled:
+        return None
+
+    msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
+
+    # API -> JSON
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "reason": "maintenance", "message": msg}), 503
+
+    # WEB -> HTML заглушка
+    return (
+        f"""
+        <!doctype html>
+        <html><head><meta charset="utf-8"><title>Maintenance</title></head>
+        <body style="background:#0b0b0b;color:#fff;font-family:system-ui;padding:40px">
+          <h2 style="margin:0 0 8px 0;">{msg}</h2>
+          <div style="opacity:.7">Спробуй пізніше.</div>
+        </body></html>
+        """,
+        503,
+    )
 
 def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
     dt = parse_dt(last_seen)
@@ -725,7 +782,13 @@ LOGIN_HTML = """
 
 def nav_html(active_tab: str):
     s = get_settings()
-    maint = (s and int(s["maintenance_enabled"] or 0) == 1)
+    sd = dict(s) if s else {}
+    enabled_raw = sd.get("maintenance_enabled")
+    if isinstance(enabled_raw, bool):
+        maint = enabled_raw
+    else:
+        maint = int(enabled_raw or 0) == 1
+
     maint_badge = ""
     if maint:
         maint_badge = """
@@ -1172,7 +1235,11 @@ def page_updates():
 @login_required
 def page_settings():
     if request.method == "POST":
-        enabled = 1 if (request.form.get("maintenance_enabled") == "1") else 0
+        # FIX: Postgres wants boolean, SQLite wants 0/1
+        enabled = (request.form.get("maintenance_enabled") == "1")
+        if not using_postgres():
+            enabled = 1 if enabled else 0
+
         msg = (request.form.get("maintenance_message") or "").strip()
         if not msg:
             msg = "Тех роботи. Спробуй пізніше."
@@ -1187,12 +1254,17 @@ def page_settings():
         conn.commit()
         conn.close()
 
-        log_action("panel", "set_maintenance", None, None, f"enabled={enabled}")
+        log_action("panel", "set_maintenance", None, None, f"enabled={int(bool(enabled))}")
         return redirect("/settings")
 
-    s = get_settings()
-    enabled = int(s["maintenance_enabled"] or 0)
-    msg = s["maintenance_message"] or "Тех роботи. Спробуй пізніше."
+    s = get_settings() or {}
+    sd = dict(s) if s else {}
+    enabled_raw = sd.get("maintenance_enabled")
+    if isinstance(enabled_raw, bool):
+        enabled = 1 if enabled_raw else 0
+    else:
+        enabled = int(enabled_raw or 0)
+    msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
 
     html = f"""
 <!DOCTYPE html>
@@ -1269,7 +1341,6 @@ def gen_keys():
             )
             made += 1
         except Exception:
-            # sqlite IntegrityError / pg UniqueViolation -> просто скіпаємо
             pass
     conn.commit()
     conn.close()
@@ -1428,10 +1499,18 @@ def download_latest():
 @app.route("/api/status")
 def api_status():
     s = get_settings()
+    sd = dict(s) if s else {}
+    enabled_raw = sd.get("maintenance_enabled")
+
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    else:
+        enabled = bool(int(enabled_raw or 0))
+
     return jsonify({
         "ok": True,
-        "maintenance_enabled": bool(int(s["maintenance_enabled"] or 0)),
-        "maintenance_message": s["maintenance_message"] or ""
+        "maintenance_enabled": enabled,
+        "maintenance_message": sd.get("maintenance_message") or ""
     })
 
 @app.route("/api/check_key", methods=["POST"])
