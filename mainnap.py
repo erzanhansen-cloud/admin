@@ -1,6 +1,4 @@
 import os
-os.environ["FLASK_SKIP_DOTENV"] = "1"
-
 import json
 import sqlite3
 import secrets
@@ -9,8 +7,6 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-
-# (optional) notify bot without external libs
 import urllib.request
 
 from flask import (
@@ -26,7 +22,24 @@ from werkzeug.utils import secure_filename
 
 
 # =========================
-# PATHS (RENDER SAFE)
+# CONFIG (NO .env FILE)
+# =========================
+
+APP_SECRET = "super-secret-local-key"   # ⚠️ зміни
+ADMIN_PIN = "Dev1234"                   # ⚠️ зміни
+
+RUNNING_WINDOW_SEC = 90                 # heartbeat window (seconds)
+
+# ✅ Anti-flood: 1 activation log per key+hwid per N seconds
+ACTIVATION_LOG_COOLDOWN_SEC = 180       # 3 хв. (постав 60 якщо хочеш 1/хв)
+
+# Optional Discord-bot hook (leave empty to disable)
+BOT_ACTIVATION_HOOK_URL = ""            # приклад: "https://YOUR-BOT.onrender.com/hook/activation"
+BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"
+
+
+# =========================
+# PATHS (Render-safe)
 # =========================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,8 +47,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def pick_data_dir() -> str:
     """
     Priority:
-    1) DATA_DIR env if writable (Paid Render with disk)
-    2) fallback to ./data (works on Free; not persistent after redeploy/restart)
+    1) DATA_DIR env if writable (Render paid disk)
+    2) fallback to ./data (free tier, not persistent after redeploy/restart)
     """
     env_dir = (os.environ.get("DATA_DIR") or "").strip()
     if env_dir:
@@ -61,21 +74,15 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 
 
 # =========================
-# APP CONFIG
+# APP
 # =========================
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("APP_SECRET", "super-secret-local-key")
-ADMIN_PIN = os.environ.get("ADMIN_PIN", "Dev1234")
-RUNNING_WINDOW_SEC = int(os.environ.get("RUNNING_WINDOW_SEC", "90"))  # heartbeat window
-
-# ✅ optional bot hook
-BOT_ACTIVATION_HOOK_URL = (os.environ.get("BOT_ACTIVATION_HOOK_URL") or "").strip()
-BOT_HOOK_SECRET = (os.environ.get("BOT_HOOK_SECRET") or "CHANGE_ME_SUPER_SECRET").strip()
+app.secret_key = APP_SECRET
 
 
 # =========================
-# HEALTH CHECK ENDPOINT
+# HEALTH CHECK
 # =========================
 @app.get("/healthz")
 def healthz():
@@ -83,7 +90,7 @@ def healthz():
 
 
 # =========================
-# DB (SQLite local / Postgres Neon)
+# DB (SQLite / Postgres Neon)
 # =========================
 
 def using_postgres() -> bool:
@@ -121,6 +128,15 @@ def split_pg_url_and_opts(url: str):
 
     return clean_url, kwargs
 
+def db_sql(sql: str) -> str:
+    """
+    Весь код пишемо з '?' як sqlite style.
+    Для Postgres міняємо на '%s'
+    """
+    if using_postgres():
+        return sql.replace("?", "%s")
+    return sql
+
 def now_value():
     """
     Для Postgres: datetime (UTC)
@@ -130,28 +146,33 @@ def now_value():
         return datetime.now(timezone.utc)
     return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d %H:%M:%S")
 
-def parse_dt(x):
+def parse_dt_sqlite(x):
+    if not x:
+        return None
+    s = str(x)
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def parse_any_dt(x):
     """
     Приймає:
       - None
-      - string 'YYYY-MM-DD HH:MM:SS' (SQLite)
-      - datetime (Postgres TIMESTAMPTZ)
+      - sqlite string 'YYYY-MM-DD HH:MM:SS'
+      - postgres datetime (aware)
     """
     if not x:
         return None
     if hasattr(x, "timestamp"):
         return x
-    s = str(x)
-    try:
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
+    return parse_dt_sqlite(x)
 
 def is_expired_row(expires_at) -> bool:
     if not expires_at:
         return False
 
-    # Postgres datetime
+    # Postgres datetime aware
     if hasattr(expires_at, "tzinfo") and hasattr(expires_at, "timestamp"):
         try:
             return expires_at < datetime.now(timezone.utc)
@@ -159,17 +180,8 @@ def is_expired_row(expires_at) -> bool:
             return False
 
     # SQLite string
-    dt = parse_dt(expires_at)
+    dt = parse_dt_sqlite(expires_at)
     return bool(dt and datetime.now() > dt)
-
-def db_sql(sql: str) -> str:
-    """
-    Ти всюди пишеш '?' (sqlite style).
-    Для Postgres замінюємо на '%s'.
-    """
-    if using_postgres():
-        return sql.replace("?", "%s")
-    return sql
 
 def get_db():
     """
@@ -292,8 +304,7 @@ def init_db():
         """)
 
         row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM app_settings WHERE id=1")
-        c = row["c"] if row else 0
-        if c == 0:
+        if (row["c"] if row else 0) == 0:
             db_execute(
                 cur,
                 "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, FALSE, ?)",
@@ -302,6 +313,7 @@ def init_db():
 
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
@@ -378,6 +390,7 @@ def init_db():
         try:
             db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
             db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
+            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
             db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
             db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
             db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
@@ -387,7 +400,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# IMPORTANT: init db even when not running __main__ (gunicorn)
+# init db on import (gunicorn)
 init_db()
 
 
@@ -417,24 +430,10 @@ def log_action(actor, action, key_id=None, key_value=None, details=None):
         INSERT INTO admin_logs (actor, action, key_id, key_value, details, ip, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            actor,
-            action,
-            key_id,
-            key_value,
-            details,
-            get_client_ip(),
-            now_value(),
-        ),
+        (actor, action, key_id, key_value, details, get_client_ip(), now_value()),
     )
     conn.commit()
     conn.close()
-
-def api_require_admin_pin():
-    pin = (request.headers.get("X-Admin-Pin") or "").strip()
-    if pin != ADMIN_PIN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return None
 
 def get_settings():
     conn = get_db()
@@ -443,7 +442,6 @@ def get_settings():
     conn.close()
     return s
 
-# ---------- maintenance_guard ----------
 def maintenance_guard():
     s = get_settings()
     if not s:
@@ -460,10 +458,8 @@ def maintenance_guard():
     if enabled:
         msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
         return jsonify({"ok": False, "reason": "maintenance", "message": msg}), 503
-
     return None
 
-# ---------- GLOBAL maintenance (closes host) ----------
 @app.before_request
 def global_maintenance():
     if request.endpoint == "static":
@@ -506,7 +502,7 @@ def global_maintenance():
     )
 
 def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
-    dt = parse_dt(last_seen)
+    dt = parse_any_dt(last_seen)
     if not dt:
         return False
     if getattr(dt, "tzinfo", None) is not None:
@@ -527,10 +523,6 @@ def _to_iso(x):
     return str(x or "")
 
 def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
-    """
-    Sends POST to BOT_ACTIVATION_HOOK_URL (if set).
-    Never breaks /api/check_key if hook is down.
-    """
     if not BOT_ACTIVATION_HOOK_URL:
         return
 
@@ -547,10 +539,7 @@ def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
         req = urllib.request.Request(
             BOT_ACTIVATION_HOOK_URL,
             data=data,
-            headers={
-                "Content-Type": "application/json",
-                "X-Hook-Secret": BOT_HOOK_SECRET,
-            },
+            headers={"Content-Type": "application/json", "X-Hook-Secret": BOT_HOOK_SECRET},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=4) as resp:
@@ -563,7 +552,61 @@ def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
 
 
 # =========================
-# UI STYLE
+# ANTI-FLOOD (activations)
+# =========================
+
+def should_log_activation(cur, key_value: str, hwid: str, ip: str) -> bool:
+    """
+    1 log per (key_value, hwid) per ACTIVATION_LOG_COOLDOWN_SEC
+    fallback: if no hwid -> per (key_value, ip)
+    """
+    cooldown = ACTIVATION_LOG_COOLDOWN_SEC
+    if cooldown <= 0:
+        return True
+
+    hw = (hwid or "").strip()
+    ipp = (ip or "").strip()
+
+    if hw:
+        row = db_fetchone(
+            cur,
+            """
+            SELECT created_at
+            FROM activations
+            WHERE key_value=? AND hwid=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (key_value, hw),
+        )
+    else:
+        row = db_fetchone(
+            cur,
+            """
+            SELECT created_at
+            FROM activations
+            WHERE key_value=? AND ip=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (key_value, ipp),
+        )
+
+    if not row:
+        return True
+
+    last_dt = parse_any_dt(row["created_at"])
+    if not last_dt:
+        return True
+
+    if getattr(last_dt, "tzinfo", None) is not None:
+        return (datetime.now(timezone.utc) - last_dt).total_seconds() >= cooldown
+
+    return (datetime.now() - last_dt).total_seconds() >= cooldown
+
+
+# =========================
+# UI STYLE (твій стиль)
 # =========================
 
 BASE_CSS = """
@@ -1528,19 +1571,17 @@ def api_status():
     s = get_settings()
     sd = dict(s) if s else {}
     enabled_raw = sd.get("maintenance_enabled")
-
     if isinstance(enabled_raw, bool):
         enabled = enabled_raw
     else:
         enabled = bool(int(enabled_raw or 0))
-
     return jsonify({
         "ok": True,
         "maintenance_enabled": enabled,
         "maintenance_message": sd.get("maintenance_message") or ""
     })
 
-# ✅✅✅ ГОЛОВНЕ: ЛОГ В activations КОЖЕН УСПІШНИЙ РАЗ
+# ✅ check_key + anti-flood activations
 @app.route("/api/check_key", methods=["POST"])
 def api_check_key():
     guard = maintenance_guard()
@@ -1575,38 +1616,37 @@ def api_check_key():
         return jsonify({"ok": False, "reason": "expired"})
 
     saved_hwid = (row["hwid"] or "").strip()
-    nowv = now_value()
     ip = get_client_ip()
+    nowv = now_value()
 
-    first_activation = False
-
-    # прив'язка HWID тільки 1 раз
+    # bind HWID only once
     if not saved_hwid:
         db_execute(cur, "UPDATE keys SET hwid=? WHERE id=?", (hwid, row["id"]))
-        first_activation = True
     else:
         if saved_hwid != hwid:
             conn.close()
             return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
-    # ✅ лог в activations КОЖЕН раз при успішному check_key
-    db_execute(
-        cur,
-        "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
-        (row["id"], row["key_value"], hwid, ip, nowv),
-    )
+    # ✅ anti-flood log in activations
+    do_log = should_log_activation(cur, row["key_value"], hwid, ip)
+    if do_log:
+        db_execute(
+            cur,
+            "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
+            (row["id"], row["key_value"], hwid, ip, nowv),
+        )
 
     conn.commit()
     conn.close()
 
-    # (optional) notify bot тільки на першій активації
-    if first_activation:
+    # optional discord hook: send only when we logged
+    if do_log:
         try:
             notify_bot_activation(key_value=row["key_value"], hwid=hwid, ip=ip, created_at=nowv)
         except Exception:
             pass
 
-    return jsonify({"ok": True, "reason": "ok"})
+    return jsonify({"ok": True, "reason": "ok", "logged": bool(do_log)})
 
 @app.route("/api/heartbeat", methods=["POST"])
 def api_heartbeat():
@@ -1642,7 +1682,6 @@ def api_heartbeat():
     conn.close()
     return jsonify({"ok": True})
 
-
 SPAM_EVENTS = {"license_ok", "heartbeat_ok", "update_check"}
 
 @app.route("/api/launcher/log", methods=["POST"])
@@ -1658,13 +1697,7 @@ def api_launcher_log():
     details = (data.get("details") or "").strip() or None
 
     payload = {"hwid": hwid, "details": details}
-    log_action(
-        "launcher",
-        event,
-        None,
-        key_value,
-        json.dumps(payload, ensure_ascii=False),
-    )
+    log_action("launcher", event, None, key_value, json.dumps(payload, ensure_ascii=False))
     return jsonify({"ok": True})
 
 
@@ -1719,13 +1752,14 @@ def api_updates_latest_download():
 
 
 # =========================
-# DS API (KEYS)
+# DS API (KEYS) - create
 # =========================
+
 @app.route("/api/ds/key/create", methods=["POST"])
 def api_ds_key_create():
-    auth_err = api_require_admin_pin()
-    if auth_err:
-        return auth_err
+    pin = (request.headers.get("X-Admin-Pin") or "").strip()
+    if pin != ADMIN_PIN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or request.form
 
@@ -1803,45 +1837,7 @@ def api_ds_key_create():
 
 
 # =========================
-# ADMIN API
-# =========================
-
-@app.route("/api/admin/updates/upload", methods=["POST"])
-def api_admin_upload_update():
-    auth_err = api_require_admin_pin()
-    if auth_err:
-        return auth_err
-
-    file = request.files.get("file")
-    if not file or file.filename == "":
-        return jsonify({"ok": False, "error": "missing_file"}), 400
-
-    version = (request.form.get("version") or "").strip()
-    note = (request.form.get("note") or "").strip()
-
-    safe_name = secure_filename(file.filename)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stored_name = f"{ts}_{safe_name}"
-    stored_path = os.path.join(STORAGE_DIR, stored_name)
-    file.save(stored_path)
-    size_bytes = os.path.getsize(stored_path)
-
-    conn = get_db()
-    cur = conn.cursor()
-    new_id = db_insert_returning_id(
-        cur,
-        "INSERT INTO updates (filename, stored_path, version, note, uploaded_at, size_bytes) VALUES (?,?,?,?,?,?)",
-        (safe_name, stored_name, version, note, now_value(), size_bytes),
-    )
-    conn.commit()
-    conn.close()
-
-    log_action("api", "upload_update", None, None, f"id={new_id}, file={safe_name}, version={version}")
-    return jsonify({"ok": True, "id": new_id, "filename": safe_name, "version": version, "size_bytes": size_bytes})
-
-
-# =========================
-# RUN (LOCAL ONLY)
+# RUN
 # =========================
 
 if __name__ == "__main__":
