@@ -3,10 +3,9 @@ import json
 import sqlite3
 import secrets
 import string
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 import urllib.request
 
 from flask import (
@@ -22,51 +21,28 @@ from werkzeug.utils import secure_filename
 
 
 # =========================
-# CONFIG (NO .env FILE)
+# CONFIG (NO ENV)
 # =========================
 
-APP_SECRET = "super-secret-local-key"   # ⚠️ зміни
-ADMIN_PIN = "Dev1234"                   # ⚠️ зміни
+APP_SECRET = "super-secret-local-key"     # ⚠️ зміни
+ADMIN_PIN = "Dev1234"                     # ⚠️ зміни
+RUNNING_WINDOW_SEC = 90                  # heartbeat window (seconds)
 
-RUNNING_WINDOW_SEC = 90                 # heartbeat window (seconds)
-
-# ✅ Anti-flood: 1 activation log per key+hwid per N seconds
-ACTIVATION_LOG_COOLDOWN_SEC = 180       # 3 хв. (постав 60 якщо хочеш 1/хв)
+# Anti-flood: 1 activation log per key+hwid per N seconds
+ACTIVATION_LOG_COOLDOWN_SEC = 600         # 10 хв (постав 60 якщо хочеш 1/хв)
 
 # Optional Discord-bot hook (leave empty to disable)
-BOT_ACTIVATION_HOOK_URL = ""            # приклад: "https://YOUR-BOT.onrender.com/hook/activation"
+BOT_ACTIVATION_HOOK_URL = ""              # приклад: "https://YOUR-BOT.onrender.com/hook/activation"
 BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"
 
 
 # =========================
-# PATHS (Render-safe)
+# PATHS (LOCAL)
 # =========================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-def pick_data_dir() -> str:
-    """
-    Priority:
-    1) DATA_DIR env if writable (Render paid disk)
-    2) fallback to ./data (free tier, not persistent after redeploy/restart)
-    """
-    env_dir = (os.environ.get("DATA_DIR") or "").strip()
-    if env_dir:
-        try:
-            os.makedirs(env_dir, exist_ok=True)
-            test_file = os.path.join(env_dir, ".write_test")
-            with open(test_file, "w", encoding="utf-8") as f:
-                f.write("ok")
-            os.remove(test_file)
-            return env_dir
-        except Exception:
-            pass
-
-    fallback = os.path.join(BASE_DIR, "data")
-    os.makedirs(fallback, exist_ok=True)
-    return fallback
-
-DATA_DIR = pick_data_dir()
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "db.sqlite3")
 STORAGE_DIR = os.path.join(DATA_DIR, "storage")
@@ -90,119 +66,28 @@ def healthz():
 
 
 # =========================
-# DB (SQLite / Postgres Neon)
+# DB (SQLite only)
 # =========================
 
-def using_postgres() -> bool:
-    return bool((os.environ.get("DATABASE_URL") or "").strip())
-
-def clean_env_url(s: str) -> str:
-    s = (s or "").strip()
-    return s.strip("'").strip('"')
-
-def split_pg_url_and_opts(url: str):
-    """
-    Забираємо sslmode/channel_binding з query URL,
-    щоб не ловити криві значення типу "invalid sslmode/channel_binding".
-    """
-    url = clean_env_url(url)
-    u = urlparse(url)
-    qs = parse_qs(u.query)
-
-    sslmode = (qs.get("sslmode", [None])[0] or "require")
-    channel_binding = (qs.get("channel_binding", [None])[0] or None)
-
-    sslmode = str(sslmode).strip("'").strip('"')
-    if channel_binding is not None:
-        channel_binding = str(channel_binding).strip("'").strip('"')
-
-    qs.pop("sslmode", None)
-    qs.pop("channel_binding", None)
-    new_query = urlencode({k: v[0] for k, v in qs.items() if v}, doseq=False)
-
-    clean_url = urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
-
-    kwargs = {"sslmode": sslmode}
-    if channel_binding:
-        kwargs["channel_binding"] = channel_binding
-
-    return clean_url, kwargs
-
-def db_sql(sql: str) -> str:
-    """
-    Весь код пишемо з '?' як sqlite style.
-    Для Postgres міняємо на '%s'
-    """
-    if using_postgres():
-        return sql.replace("?", "%s")
-    return sql
-
 def now_value():
-    """
-    Для Postgres: datetime (UTC)
-    Для SQLite: string (Kyiv time)
-    """
-    if using_postgres():
-        return datetime.now(timezone.utc)
     return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d %H:%M:%S")
 
-def parse_dt_sqlite(x):
+def parse_dt(x):
     if not x:
         return None
     s = str(x)
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except Exception:
+    except ValueError:
         return None
-
-def parse_any_dt(x):
-    """
-    Приймає:
-      - None
-      - sqlite string 'YYYY-MM-DD HH:MM:SS'
-      - postgres datetime (aware)
-    """
-    if not x:
-        return None
-    if hasattr(x, "timestamp"):
-        return x
-    return parse_dt_sqlite(x)
 
 def is_expired_row(expires_at) -> bool:
     if not expires_at:
         return False
-
-    # Postgres datetime aware
-    if hasattr(expires_at, "tzinfo") and hasattr(expires_at, "timestamp"):
-        try:
-            return expires_at < datetime.now(timezone.utc)
-        except Exception:
-            return False
-
-    # SQLite string
-    dt = parse_dt_sqlite(expires_at)
+    dt = parse_dt(expires_at)
     return bool(dt and datetime.now() > dt)
 
 def get_db():
-    """
-    If DATABASE_URL exists -> Postgres (Neon)
-    else -> SQLite (local)
-    """
-    if using_postgres():
-        import psycopg
-        from psycopg.rows import dict_row
-
-        raw = os.environ.get("DATABASE_URL", "")
-        clean_url, opts = split_pg_url_and_opts(raw)
-
-        conn = psycopg.connect(
-            clean_url,
-            row_factory=dict_row,
-            autocommit=False,
-            **opts,
-        )
-        return conn
-
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON;")
@@ -212,7 +97,7 @@ def get_db():
     return conn
 
 def db_execute(cur, sql: str, params=()):
-    return cur.execute(db_sql(sql), params)
+    return cur.execute(sql, params)
 
 def db_fetchone(cur, sql: str, params=()):
     db_execute(cur, sql, params)
@@ -223,184 +108,94 @@ def db_fetchall(cur, sql: str, params=()):
     return cur.fetchall()
 
 def db_insert_returning_id(cur, sql: str, params=()):
-    """
-    SQLite: cur.lastrowid
-    Postgres: RETURNING id
-    """
-    if using_postgres():
-        sql2 = sql.strip().rstrip(";")
-        if "returning" not in sql2.lower():
-            sql2 += " RETURNING id"
-        db_execute(cur, sql2, params)
-        row = cur.fetchone() or {}
-        return row.get("id")
-    else:
-        db_execute(cur, sql, params)
-        return cur.lastrowid
+    db_execute(cur, sql, params)
+    return cur.lastrowid
 
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    if using_postgres():
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS keys (
-            id           SERIAL PRIMARY KEY,
-            key_value    TEXT NOT NULL UNIQUE,
-            owner        TEXT,
-            note         TEXT,
-            is_active    BOOLEAN NOT NULL DEFAULT TRUE,
-            is_banned    BOOLEAN NOT NULL DEFAULT FALSE,
-            ban_reason   TEXT,
-            created_at   TIMESTAMPTZ DEFAULT NOW(),
-            expires_at   TIMESTAMPTZ,
-            hwid         TEXT,
-            last_seen    TIMESTAMPTZ
-        );
-        """)
+    db_execute(cur, """
+    CREATE TABLE IF NOT EXISTS keys (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        key_value   TEXT NOT NULL UNIQUE,
+        owner       TEXT,
+        note        TEXT,
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        is_banned   INTEGER NOT NULL DEFAULT 0,
+        ban_reason  TEXT,
+        created_at  TEXT,
+        expires_at  TEXT,
+        hwid        TEXT,
+        last_seen   TEXT
+    )
+    """)
 
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS activations (
-            id          SERIAL PRIMARY KEY,
-            key_id      INTEGER,
-            key_value   TEXT,
-            hwid        TEXT,
-            ip          TEXT,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-        """)
+    db_execute(cur, """
+    CREATE TABLE IF NOT EXISTS activations (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        key_id          INTEGER,
+        key_value       TEXT,
+        hwid            TEXT,
+        ip              TEXT,
+        created_at      TEXT
+    )
+    """)
 
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS updates (
-            id          SERIAL PRIMARY KEY,
-            filename    TEXT,
-            stored_path TEXT,
-            version     TEXT,
-            note        TEXT,
-            uploaded_at TIMESTAMPTZ DEFAULT NOW(),
-            size_bytes  BIGINT
-        );
-        """)
+    db_execute(cur, """
+    CREATE TABLE IF NOT EXISTS updates (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename    TEXT,
+        stored_path TEXT,
+        version     TEXT,
+        note        TEXT,
+        uploaded_at TEXT,
+        size_bytes  INTEGER
+    )
+    """)
 
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS admin_logs (
-            id         SERIAL PRIMARY KEY,
-            actor      TEXT,
-            action     TEXT,
-            key_id     INTEGER,
-            key_value  TEXT,
-            details    TEXT,
-            ip         TEXT,
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        );
-        """)
+    db_execute(cur, """
+    CREATE TABLE IF NOT EXISTS admin_logs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor       TEXT,
+        action      TEXT,
+        key_id      INTEGER,
+        key_value   TEXT,
+        details     TEXT,
+        ip          TEXT,
+        created_at  TEXT
+    )
+    """)
 
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS app_settings (
-            id                  INTEGER PRIMARY KEY,
-            maintenance_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-            maintenance_message TEXT
-        );
-        """)
+    db_execute(cur, """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        id                  INTEGER PRIMARY KEY CHECK (id = 1),
+        maintenance_enabled INTEGER NOT NULL DEFAULT 0,
+        maintenance_message TEXT
+    )
+    """)
 
-        row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM app_settings WHERE id=1")
-        if (row["c"] if row else 0) == 0:
-            db_execute(
-                cur,
-                "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, FALSE, ?)",
-                ("Тех роботи. Спробуй пізніше.",),
-            )
+    row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM app_settings")
+    if (row["c"] if row else 0) == 0:
+        db_execute(
+            cur,
+            "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, 0, ?)",
+            ("Тех роботи. Спробуй пізніше.",),
+        )
 
+    try:
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
-        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
-
-    else:
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS keys (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_value   TEXT NOT NULL UNIQUE,
-            owner       TEXT,
-            note        TEXT,
-            is_active   INTEGER NOT NULL DEFAULT 1,
-            is_banned   INTEGER NOT NULL DEFAULT 0,
-            ban_reason  TEXT,
-            created_at  TEXT,
-            expires_at  TEXT,
-            hwid        TEXT,
-            last_seen   TEXT
-        )
-        """)
-
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS activations (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id          INTEGER,
-            key_value       TEXT,
-            hwid            TEXT,
-            ip              TEXT,
-            created_at      TEXT
-        )
-        """)
-
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS updates (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename    TEXT,
-            stored_path TEXT,
-            version     TEXT,
-            note        TEXT,
-            uploaded_at TEXT,
-            size_bytes  INTEGER
-        )
-        """)
-
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS admin_logs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor       TEXT,
-            action      TEXT,
-            key_id      INTEGER,
-            key_value   TEXT,
-            details     TEXT,
-            ip          TEXT,
-            created_at  TEXT
-        )
-        """)
-
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS app_settings (
-            id                  INTEGER PRIMARY KEY CHECK (id = 1),
-            maintenance_enabled INTEGER NOT NULL DEFAULT 0,
-            maintenance_message TEXT
-        )
-        """)
-
-        row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM app_settings")
-        if (row["c"] if row else 0) == 0:
-            db_execute(
-                cur,
-                "INSERT INTO app_settings (id, maintenance_enabled, maintenance_message) VALUES (1, 0, ?)",
-                ("Тех роботи. Спробуй пізніше.",),
-            )
-
-        try:
-            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
-            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
-            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
-            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
-            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
-            db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
-        except sqlite3.OperationalError:
-            pass
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     conn.close()
 
-# init db on import (gunicorn)
 init_db()
 
 
@@ -448,13 +243,7 @@ def maintenance_guard():
         return None
 
     sd = dict(s)
-    enabled_raw = sd.get("maintenance_enabled")
-
-    if isinstance(enabled_raw, bool):
-        enabled = enabled_raw
-    else:
-        enabled = int(enabled_raw or 0) == 1
-
+    enabled = int(sd.get("maintenance_enabled") or 0) == 1
     if enabled:
         msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
         return jsonify({"ok": False, "reason": "maintenance", "message": msg}), 503
@@ -475,12 +264,7 @@ def global_maintenance():
         return None
 
     sd = dict(s)
-    enabled_raw = sd.get("maintenance_enabled")
-    if isinstance(enabled_raw, bool):
-        enabled = enabled_raw
-    else:
-        enabled = int(enabled_raw or 0) == 1
-
+    enabled = int(sd.get("maintenance_enabled") or 0) == 1
     if not enabled:
         return None
 
@@ -502,11 +286,9 @@ def global_maintenance():
     )
 
 def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
-    dt = parse_any_dt(last_seen)
+    dt = parse_dt(last_seen)
     if not dt:
         return False
-    if getattr(dt, "tzinfo", None) is not None:
-        return (datetime.now(timezone.utc) - dt).total_seconds() <= window_sec
     return (datetime.now() - dt).total_seconds() <= window_sec
 
 
@@ -515,11 +297,6 @@ def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
 # =========================
 
 def _to_iso(x):
-    if hasattr(x, "isoformat"):
-        try:
-            return x.isoformat()
-        except Exception:
-            return str(x)
     return str(x or "")
 
 def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
@@ -555,58 +332,37 @@ def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
 # ANTI-FLOOD (activations)
 # =========================
 
-def should_log_activation(cur, key_value: str, hwid: str, ip: str) -> bool:
+def should_log_activation(cur, key_value: str, hwid: str, cooldown_sec: int) -> bool:
     """
-    1 log per (key_value, hwid) per ACTIVATION_LOG_COOLDOWN_SEC
-    fallback: if no hwid -> per (key_value, ip)
+    1 log per (key_value, hwid) per cooldown_sec
     """
-    cooldown = ACTIVATION_LOG_COOLDOWN_SEC
-    if cooldown <= 0:
+    if cooldown_sec <= 0:
         return True
 
-    hw = (hwid or "").strip()
-    ipp = (ip or "").strip()
-
-    if hw:
-        row = db_fetchone(
-            cur,
-            """
-            SELECT created_at
-            FROM activations
-            WHERE key_value=? AND hwid=?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (key_value, hw),
-        )
-    else:
-        row = db_fetchone(
-            cur,
-            """
-            SELECT created_at
-            FROM activations
-            WHERE key_value=? AND ip=?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (key_value, ipp),
-        )
-
-    if not row:
+    last = db_fetchone(
+        cur,
+        """
+        SELECT created_at
+        FROM activations
+        WHERE key_value=? AND hwid=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (key_value, hwid),
+    )
+    if not last:
         return True
 
-    last_dt = parse_any_dt(row["created_at"])
+    last_dt = parse_dt(last["created_at"])
     if not last_dt:
         return True
 
-    if getattr(last_dt, "tzinfo", None) is not None:
-        return (datetime.now(timezone.utc) - last_dt).total_seconds() >= cooldown
-
-    return (datetime.now() - last_dt).total_seconds() >= cooldown
+    diff = (datetime.now() - last_dt).total_seconds()
+    return diff >= float(cooldown_sec)
 
 
 # =========================
-# UI STYLE (твій стиль)
+# UI STYLE
 # =========================
 
 BASE_CSS = """
@@ -634,6 +390,7 @@ h1{
   letter-spacing:3px;
   text-shadow:0 0 18px #ff7b00;
 }
+/* NAV */
 .top-nav{
   max-width:1600px;
   margin:0 auto 16px;
@@ -667,6 +424,7 @@ h1{
   border-color:rgba(255,140,26,.14);
 }
 .nav-right{display:flex;gap:8px;flex-wrap:wrap}
+/* PANEL */
 .panel{
   max-width:1600px;
   margin:0 auto 40px;
@@ -707,6 +465,7 @@ input:focus,select:focus,textarea:focus{
   border-color:#ff8c1a;
   box-shadow:0 0 0 3px rgba(255,140,26,.15);
 }
+/* Buttons */
 button{
   border:1px solid transparent;
   border-radius:12px;
@@ -757,6 +516,7 @@ button:active{transform:translateY(1px) scale(.99)}
   transform:translateY(-1px);
   box-shadow:0 0 0 3px rgba(255,90,95,.12),0 18px 36px rgba(0,0,0,.35);
 }
+/* Table */
 table{
   width:100%;
   min-width:1750px;
@@ -797,6 +557,7 @@ tr:hover{background:rgba(255,140,26,.06)}
 .tbl-input.hwid{min-width:320px}
 .tbl-input.expires{min-width:200px}
 .tbl-checkbox{display:flex;justify-content:center;align-items:center}
+/* Actions */
 .actions{
   display:flex;
   flex-direction:column;
@@ -804,6 +565,7 @@ tr:hover{background:rgba(255,140,26,.06)}
   min-width:150px;
 }
 .actions form{margin:0}
+/* Badges */
 .badge{
   display:inline-flex;
   align-items:center;
@@ -854,11 +616,7 @@ LOGIN_HTML = """
 def nav_html(active_tab: str):
     s = get_settings()
     sd = dict(s) if s else {}
-    enabled_raw = sd.get("maintenance_enabled")
-    if isinstance(enabled_raw, bool):
-        maint = enabled_raw
-    else:
-        maint = int(enabled_raw or 0) == 1
+    maint = int(sd.get("maintenance_enabled") or 0) == 1
 
     maint_badge = ""
     if maint:
@@ -1306,34 +1064,21 @@ def page_updates():
 @login_required
 def page_settings():
     if request.method == "POST":
-        enabled = (request.form.get("maintenance_enabled") == "1")
-        if not using_postgres():
-            enabled = 1 if enabled else 0
-
-        msg = (request.form.get("maintenance_message") or "").strip()
-        if not msg:
-            msg = "Тех роботи. Спробуй пізніше."
+        enabled = 1 if (request.form.get("maintenance_enabled") == "1") else 0
+        msg = (request.form.get("maintenance_message") or "").strip() or "Тех роботи. Спробуй пізніше."
 
         conn = get_db()
         cur = conn.cursor()
-        db_execute(
-            cur,
-            "UPDATE app_settings SET maintenance_enabled=?, maintenance_message=? WHERE id=1",
-            (enabled, msg),
-        )
+        db_execute(cur, "UPDATE app_settings SET maintenance_enabled=?, maintenance_message=? WHERE id=1", (enabled, msg))
         conn.commit()
         conn.close()
 
-        log_action("panel", "set_maintenance", None, None, f"enabled={int(bool(enabled))}")
+        log_action("panel", "set_maintenance", None, None, f"enabled={enabled}")
         return redirect("/settings")
 
     s = get_settings() or {}
     sd = dict(s) if s else {}
-    enabled_raw = sd.get("maintenance_enabled")
-    if isinstance(enabled_raw, bool):
-        enabled = 1 if enabled_raw else 0
-    else:
-        enabled = int(enabled_raw or 0)
+    enabled = int(sd.get("maintenance_enabled") or 0)
     msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
 
     html = f"""
@@ -1393,10 +1138,7 @@ def gen_keys():
     created_at = now_value()
     expires_at = None
     if days > 0:
-        if using_postgres():
-            expires_at = datetime.now(timezone.utc) + timedelta(days=days)
-        else:
-            expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
     cur = conn.cursor()
@@ -1407,7 +1149,7 @@ def gen_keys():
             db_execute(
                 cur,
                 "INSERT INTO keys (key_value, is_active, is_banned, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-                (key_value, (True if using_postgres() else 1), (False if using_postgres() else 0), created_at, expires_at),
+                (key_value, 1, 0, created_at, expires_at),
             )
             made += 1
         except Exception:
@@ -1429,11 +1171,8 @@ def key_update(key_id):
     expires_at = (f.get("expires_at") or "").strip()
     hwid = (f.get("hwid") or "").strip()
 
-    is_active = True if f.get("is_active") == "1" else False
-    is_banned = True if f.get("is_banned") == "1" else False
-    if not using_postgres():
-        is_active = 1 if is_active else 0
-        is_banned = 1 if is_banned else 0
+    is_active = 1 if (f.get("is_active") == "1") else 0
+    is_banned = 1 if (f.get("is_banned") == "1") else 0
 
     conn = get_db()
     cur = conn.cursor()
@@ -1460,7 +1199,7 @@ def key_ban(key_id):
     row = db_fetchone(cur, "SELECT key_value FROM keys WHERE id=?", (key_id,))
     key_val = row["key_value"] if row else None
 
-    db_execute(cur, "UPDATE keys SET is_banned=?, ban_reason='panel ban' WHERE id=?", ((True if using_postgres() else 1), key_id))
+    db_execute(cur, "UPDATE keys SET is_banned=1, ban_reason='panel ban' WHERE id=?", (key_id,))
     conn.commit()
     conn.close()
 
@@ -1475,7 +1214,7 @@ def key_unban(key_id):
     row = db_fetchone(cur, "SELECT key_value FROM keys WHERE id=?", (key_id,))
     key_val = row["key_value"] if row else None
 
-    db_execute(cur, "UPDATE keys SET is_banned=?, ban_reason=NULL WHERE id=?", ((False if using_postgres() else 0), key_id))
+    db_execute(cur, "UPDATE keys SET is_banned=0, ban_reason=NULL WHERE id=?", (key_id,))
     conn.commit()
     conn.close()
 
@@ -1570,11 +1309,7 @@ def download_latest():
 def api_status():
     s = get_settings()
     sd = dict(s) if s else {}
-    enabled_raw = sd.get("maintenance_enabled")
-    if isinstance(enabled_raw, bool):
-        enabled = enabled_raw
-    else:
-        enabled = bool(int(enabled_raw or 0))
+    enabled = bool(int(sd.get("maintenance_enabled") or 0))
     return jsonify({
         "ok": True,
         "maintenance_enabled": enabled,
@@ -1619,16 +1354,19 @@ def api_check_key():
     ip = get_client_ip()
     nowv = now_value()
 
+    first_activation = False
+
     # bind HWID only once
     if not saved_hwid:
         db_execute(cur, "UPDATE keys SET hwid=? WHERE id=?", (hwid, row["id"]))
+        first_activation = True
     else:
         if saved_hwid != hwid:
             conn.close()
             return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
-    # ✅ anti-flood log in activations
-    do_log = should_log_activation(cur, row["key_value"], hwid, ip)
+    # anti-flood log
+    do_log = should_log_activation(cur, row["key_value"], hwid, ACTIVATION_LOG_COOLDOWN_SEC)
     if do_log:
         db_execute(
             cur,
@@ -1639,14 +1377,15 @@ def api_check_key():
     conn.commit()
     conn.close()
 
-    # optional discord hook: send only when we logged
-    if do_log:
+    # ✅ discord hook: send only when actually logged (no flood)
+    # and only on first activation (як ти хотів)
+    if do_log and first_activation:
         try:
             notify_bot_activation(key_value=row["key_value"], hwid=hwid, ip=ip, created_at=nowv)
         except Exception:
             pass
 
-    return jsonify({"ok": True, "reason": "ok", "logged": bool(do_log)})
+    return jsonify({"ok": True, "reason": "ok", "logged": bool(do_log), "first": bool(first_activation)})
 
 @app.route("/api/heartbeat", methods=["POST"])
 def api_heartbeat():
@@ -1752,7 +1491,7 @@ def api_updates_latest_download():
 
 
 # =========================
-# DS API (KEYS) - create
+# DS API (KEYS) - simple create
 # =========================
 
 @app.route("/api/ds/key/create", methods=["POST"])
@@ -1782,10 +1521,7 @@ def api_ds_key_create():
     created_at = now_value()
     expires_at = None
     if days > 0:
-        if using_postgres():
-            expires_at = datetime.now(timezone.utc) + timedelta(days=days)
-        else:
-            expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
     cur = conn.cursor()
@@ -1800,17 +1536,9 @@ def api_ds_key_create():
                     cur,
                     """
                     INSERT INTO keys (key_value, owner, note, is_active, is_banned, created_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, 1, 0, ?, ?)
                     """,
-                    (
-                        kv,
-                        owner,
-                        note,
-                        (True if using_postgres() else 1),
-                        (False if using_postgres() else 0),
-                        created_at,
-                        expires_at,
-                    ),
+                    (kv, owner, note, created_at, expires_at),
                 )
                 keys.append(kv)
                 made += 1
@@ -1832,7 +1560,7 @@ def api_ds_key_create():
         "days": days,
         "owner": owner or "",
         "note": note or "",
-        "expires_at": (expires_at.isoformat() if hasattr(expires_at, "isoformat") else (expires_at or "")),
+        "expires_at": expires_at or "",
     })
 
 
@@ -1841,5 +1569,4 @@ def api_ds_key_create():
 # =========================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False)
