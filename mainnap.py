@@ -10,6 +10,9 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
+# (optional) notify bot without external libs
+import urllib.request
+
 from flask import (
     Flask,
     request,
@@ -66,6 +69,10 @@ app.secret_key = os.environ.get("APP_SECRET", "super-secret-local-key")
 ADMIN_PIN = os.environ.get("ADMIN_PIN", "Dev1234")
 RUNNING_WINDOW_SEC = int(os.environ.get("RUNNING_WINDOW_SEC", "90"))  # heartbeat window
 
+# ✅ optional bot hook
+BOT_ACTIVATION_HOOK_URL = (os.environ.get("BOT_ACTIVATION_HOOK_URL") or "").strip()
+BOT_HOOK_SECRET = (os.environ.get("BOT_HOOK_SECRET") or "CHANGE_ME_SUPER_SECRET").strip()
+
 
 # =========================
 # HEALTH CHECK ENDPOINT
@@ -106,9 +113,7 @@ def split_pg_url_and_opts(url: str):
     qs.pop("channel_binding", None)
     new_query = urlencode({k: v[0] for k, v in qs.items() if v}, doseq=False)
 
-    clean_url = urlunparse((
-        u.scheme, u.netloc, u.path, u.params, new_query, u.fragment
-    ))
+    clean_url = urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
 
     kwargs = {"sslmode": sslmode}
     if channel_binding:
@@ -395,7 +400,6 @@ def rand_key(prefix="FARM-"):
     return prefix + "".join(secrets.choice(abc) for _ in range(16))
 
 def get_client_ip():
-    # Render: real IP is in X-Forwarded-For
     xff = (request.headers.get("X-Forwarded-For") or "").strip()
     if xff:
         return xff.split(",")[0].strip()
@@ -439,16 +443,15 @@ def get_settings():
     conn.close()
     return s
 
-# ---------- FIXED maintenance_guard ----------
+# ---------- maintenance_guard ----------
 def maintenance_guard():
     s = get_settings()
     if not s:
         return None
 
-    sd = dict(s)  # sqlite Row або pg dict_row -> dict
+    sd = dict(s)
     enabled_raw = sd.get("maintenance_enabled")
 
-    # SQLite: 0/1, Postgres: True/False
     if isinstance(enabled_raw, bool):
         enabled = enabled_raw
     else:
@@ -463,13 +466,10 @@ def maintenance_guard():
 # ---------- GLOBAL maintenance (closes host) ----------
 @app.before_request
 def global_maintenance():
-    # static завжди доступний
     if request.endpoint == "static":
         return None
 
     ep = request.endpoint or ""
-
-    # whitelist: можна зайти і вимкнути тех-режим
     allowed = {"healthz", "login", "logout", "page_settings"}
     if ep in allowed:
         return None
@@ -480,7 +480,6 @@ def global_maintenance():
 
     sd = dict(s)
     enabled_raw = sd.get("maintenance_enabled")
-
     if isinstance(enabled_raw, bool):
         enabled = enabled_raw
     else:
@@ -491,11 +490,9 @@ def global_maintenance():
 
     msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
 
-    # API -> JSON
     if request.path.startswith("/api/"):
         return jsonify({"ok": False, "reason": "maintenance", "message": msg}), 503
 
-    # WEB -> HTML заглушка
     return (
         f"""
         <!doctype html>
@@ -518,9 +515,57 @@ def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
 
 
 # =========================
-# UI STYLE (WIDER TABLES FIX)
+# BOT NOTIFY (optional)
 # =========================
-# (CSS + HTML без змін)
+
+def _to_iso(x):
+    if hasattr(x, "isoformat"):
+        try:
+            return x.isoformat()
+        except Exception:
+            return str(x)
+    return str(x or "")
+
+def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
+    """
+    Sends POST to BOT_ACTIVATION_HOOK_URL (if set).
+    Never breaks /api/check_key if hook is down.
+    """
+    if not BOT_ACTIVATION_HOOK_URL:
+        return
+
+    payload = {
+        "event": "activation",
+        "key": key_value,
+        "hwid": hwid,
+        "ip": ip,
+        "created_at": _to_iso(created_at),
+    }
+
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            BOT_ACTIVATION_HOOK_URL,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hook-Secret": BOT_HOOK_SECRET,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            _ = resp.read()
+    except Exception as e:
+        try:
+            log_action("panel", "bot_notify_failed", None, key_value, str(e))
+        except Exception:
+            pass
+
+
+# =========================
+# UI STYLE
+# =========================
+
 BASE_CSS = """
 *{box-sizing:border-box}
 body{
@@ -546,8 +591,6 @@ h1{
   letter-spacing:3px;
   text-shadow:0 0 18px #ff7b00;
 }
-
-/* NAV */
 .top-nav{
   max-width:1600px;
   margin:0 auto 16px;
@@ -581,8 +624,6 @@ h1{
   border-color:rgba(255,140,26,.14);
 }
 .nav-right{display:flex;gap:8px;flex-wrap:wrap}
-
-/* PANEL + TABLE WIDTH FIX */
 .panel{
   max-width:1600px;
   margin:0 auto 40px;
@@ -593,14 +634,12 @@ h1{
   padding:18px 20px 22px;
   overflow-x:auto;
 }
-
 .section-title{
   font-size:20px;
   margin:10px 0 10px;
   color:#ffb35c;
   letter-spacing:.6px;
 }
-
 .form-row{
   display:flex;
   flex-wrap:wrap;
@@ -625,8 +664,6 @@ input:focus,select:focus,textarea:focus{
   border-color:#ff8c1a;
   box-shadow:0 0 0 3px rgba(255,140,26,.15);
 }
-
-/* Buttons */
 button{
   border:1px solid transparent;
   border-radius:12px;
@@ -640,7 +677,6 @@ button{
 }
 button:active{transform:translateY(1px) scale(.99)}
 .btn-small{padding:7px 10px;font-size:12px;border-radius:11px}
-
 .btn-main{
   background:linear-gradient(135deg,#ff9a2a,#ff3b0a);
   border-color:rgba(255,140,26,.35);
@@ -678,8 +714,6 @@ button:active{transform:translateY(1px) scale(.99)}
   transform:translateY(-1px);
   box-shadow:0 0 0 3px rgba(255,90,95,.12),0 18px 36px rgba(0,0,0,.35);
 }
-
-/* Table: wider + no squeezing */
 table{
   width:100%;
   min-width:1750px;
@@ -704,7 +738,6 @@ th{
 }
 tr:nth-child(even){background:#070b10}
 tr:hover{background:rgba(255,140,26,.06)}
-
 .tbl-input{
   width:100%;
   min-width:120px;
@@ -720,10 +753,7 @@ tr:hover{background:rgba(255,140,26,.06)}
 .tbl-input.note{min-width:240px}
 .tbl-input.hwid{min-width:320px}
 .tbl-input.expires{min-width:200px}
-
 .tbl-checkbox{display:flex;justify-content:center;align-items:center}
-
-/* Actions: stack buttons nicely */
 .actions{
   display:flex;
   flex-direction:column;
@@ -731,8 +761,6 @@ tr:hover{background:rgba(255,140,26,.06)}
   min-width:150px;
 }
 .actions form{margin:0}
-
-/* Badges */
 .badge{
   display:inline-flex;
   align-items:center;
@@ -852,7 +880,6 @@ def logout():
 # =========================
 # PAGES
 # =========================
-# (PAGES без змін)
 
 @app.route("/")
 @login_required
@@ -1236,7 +1263,6 @@ def page_updates():
 @login_required
 def page_settings():
     if request.method == "POST":
-        # FIX: Postgres wants boolean, SQLite wants 0/1
         enabled = (request.form.get("maintenance_enabled") == "1")
         if not using_postgres():
             enabled = 1 if enabled else 0
@@ -1327,7 +1353,6 @@ def gen_keys():
         if using_postgres():
             expires_at = datetime.now(timezone.utc) + timedelta(days=days)
         else:
-            # ✅ Kyiv TZ (щоб було рівно як now_value для SQLite)
             expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
@@ -1515,6 +1540,7 @@ def api_status():
         "maintenance_message": sd.get("maintenance_message") or ""
     })
 
+# ✅✅✅ ГОЛОВНЕ: ЛОГ В activations КОЖЕН УСПІШНИЙ РАЗ
 @app.route("/api/check_key", methods=["POST"])
 def api_check_key():
     guard = maintenance_guard()
@@ -1550,23 +1576,36 @@ def api_check_key():
 
     saved_hwid = (row["hwid"] or "").strip()
     nowv = now_value()
+    ip = get_client_ip()
 
-    # ❗ АКТИВАЦІЯ ТІЛЬКИ 1 РАЗ
+    first_activation = False
+
+    # прив'язка HWID тільки 1 раз
     if not saved_hwid:
         db_execute(cur, "UPDATE keys SET hwid=? WHERE id=?", (hwid, row["id"]))
-
-        db_execute(
-            cur,
-            "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
-            (row["id"], row["key_value"], hwid, get_client_ip(), nowv),
-        )
+        first_activation = True
     else:
         if saved_hwid != hwid:
             conn.close()
             return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
+    # ✅ лог в activations КОЖЕН раз при успішному check_key
+    db_execute(
+        cur,
+        "INSERT INTO activations (key_id, key_value, hwid, ip, created_at) VALUES (?,?,?,?,?)",
+        (row["id"], row["key_value"], hwid, ip, nowv),
+    )
+
     conn.commit()
     conn.close()
+
+    # (optional) notify bot тільки на першій активації
+    if first_activation:
+        try:
+            notify_bot_activation(key_value=row["key_value"], hwid=hwid, ip=ip, created_at=nowv)
+        except Exception:
+            pass
+
     return jsonify({"ok": True, "reason": "ok"})
 
 @app.route("/api/heartbeat", methods=["POST"])
@@ -1604,11 +1643,7 @@ def api_heartbeat():
     return jsonify({"ok": True})
 
 
-SPAM_EVENTS = {
-    "license_ok",
-    "heartbeat_ok",
-    "update_check",
-}
+SPAM_EVENTS = {"license_ok", "heartbeat_ok", "update_check"}
 
 @app.route("/api/launcher/log", methods=["POST"])
 def api_launcher_log():
@@ -1684,25 +1719,10 @@ def api_updates_latest_download():
 
 
 # =========================
-# DS API (KEYS)  ✅ NEW
+# DS API (KEYS)
 # =========================
 @app.route("/api/ds/key/create", methods=["POST"])
 def api_ds_key_create():
-    """
-    Create one or many keys (store in DB).
-
-    Auth: header X-Admin-Pin: <ADMIN_PIN>
-
-    JSON/body fields:
-      - prefix (default "FARM-")
-      - count  (default 1, max 500)
-      - days   (default 0, max 365)  # TTL in days
-      - owner  (optional)
-      - note   (optional)
-
-    Returns:
-      { ok: true, keys: ["FARM-....", ...], made: N, requested: count }
-    """
     auth_err = api_require_admin_pin()
     if auth_err:
         return auth_err
@@ -1738,9 +1758,7 @@ def api_ds_key_create():
 
     keys = []
     made = 0
-    # генеруємо унікальні ключі і вставляємо
     for _ in range(count):
-        # кілька спроб на випадок колізії UNIQUE
         for _attempt in range(7):
             kv = rand_key(prefix)
             try:
