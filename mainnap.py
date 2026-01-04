@@ -520,7 +520,7 @@ def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
 # =========================
 # UI STYLE (WIDER TABLES FIX)
 # =========================
-
+# (CSS + HTML без змін)
 BASE_CSS = """
 *{box-sizing:border-box}
 body{
@@ -852,6 +852,7 @@ def logout():
 # =========================
 # PAGES
 # =========================
+# (PAGES без змін)
 
 @app.route("/")
 @login_required
@@ -1326,7 +1327,8 @@ def gen_keys():
         if using_postgres():
             expires_at = datetime.now(timezone.utc) + timedelta(days=days)
         else:
-            expires_at = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+            # ✅ Kyiv TZ (щоб було рівно як now_value для SQLite)
+            expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
     cur = conn.cursor()
@@ -1679,6 +1681,107 @@ def api_updates_latest_download():
         as_attachment=True,
         download_name=row["filename"],
     )
+
+
+# =========================
+# DS API (KEYS)  ✅ NEW
+# =========================
+@app.route("/api/ds/key/create", methods=["POST"])
+def api_ds_key_create():
+    """
+    Create one or many keys (store in DB).
+
+    Auth: header X-Admin-Pin: <ADMIN_PIN>
+
+    JSON/body fields:
+      - prefix (default "FARM-")
+      - count  (default 1, max 500)
+      - days   (default 0, max 365)  # TTL in days
+      - owner  (optional)
+      - note   (optional)
+
+    Returns:
+      { ok: true, keys: ["FARM-....", ...], made: N, requested: count }
+    """
+    auth_err = api_require_admin_pin()
+    if auth_err:
+        return auth_err
+
+    data = request.get_json(silent=True) or request.form
+
+    prefix = (data.get("prefix") or "FARM-").strip() or "FARM-"
+    owner = (data.get("owner") or "").strip() or None
+    note = (data.get("note") or "").strip() or None
+
+    try:
+        count = int(data.get("count") or 1)
+    except ValueError:
+        count = 1
+    try:
+        days = int(data.get("days") or 0)
+    except ValueError:
+        days = 0
+
+    count = max(1, min(500, count))
+    days = max(0, min(365, days))
+
+    created_at = now_value()
+    expires_at = None
+    if days > 0:
+        if using_postgres():
+            expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+        else:
+            expires_at = (datetime.now(ZoneInfo("Europe/Kyiv")) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    keys = []
+    made = 0
+    # генеруємо унікальні ключі і вставляємо
+    for _ in range(count):
+        # кілька спроб на випадок колізії UNIQUE
+        for _attempt in range(7):
+            kv = rand_key(prefix)
+            try:
+                db_execute(
+                    cur,
+                    """
+                    INSERT INTO keys (key_value, owner, note, is_active, is_banned, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        kv,
+                        owner,
+                        note,
+                        (True if using_postgres() else 1),
+                        (False if using_postgres() else 0),
+                        created_at,
+                        expires_at,
+                    ),
+                )
+                keys.append(kv)
+                made += 1
+                break
+            except Exception:
+                continue
+
+    conn.commit()
+    conn.close()
+
+    log_action("ds", "ds_key_create", None, None, f"prefix={prefix}, requested={count}, made={made}, days={days}, owner={owner or ''}")
+
+    return jsonify({
+        "ok": True,
+        "requested": count,
+        "made": made,
+        "keys": keys,
+        "prefix": prefix,
+        "days": days,
+        "owner": owner or "",
+        "note": note or "",
+        "expires_at": (expires_at.isoformat() if hasattr(expires_at, "isoformat") else (expires_at or "")),
+    })
 
 
 # =========================
