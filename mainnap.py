@@ -27,9 +27,8 @@ from werkzeug.utils import secure_filename
 # CONFIG (NO ENV)
 # =========================
 
-APP_SECRET = "AdminGatylo"  # НЕ став сюди Dev1234, це погано
-
-ADMIN_PIN = "Dev1234"  # перший пін тільки для 1-го входу (потім з БД)
+APP_SECRET = "AdminGatylo"          # для flask session (будь-який довгий)
+ADMIN_PIN = "Dev1234"              # перший пін, тільки для першого входу (потім буде з БД)
 
 RUNNING_WINDOW_SEC = 90
 ACTIVATION_LOG_COOLDOWN_SEC = 600
@@ -37,19 +36,17 @@ ACTIVATION_LOG_COOLDOWN_SEC = 600
 # --- BOT CONTROL API секрет (має співпадати з ботом 1:1) ---
 BOT_API_SECRET = "Dev1234"
 
-# --- optional webhook from server -> bot (можеш не юзати) ---
-BOT_ACTIVATION_HOOK_URL = ""
-BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"
+# --- optional webhook from server -> bot (можеш НЕ юзати взагалі) ---
+BOT_ACTIVATION_HOOK_URL = ""       # лишай пустим
+BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"  # лишай як є (не використовується якщо URL пустий)
 
-# --- Discord logging webhooks (бот дасть після /setup) ---
+# --- Discord logging webhooks (вставив твої) ---
 DISCORD_WEBHOOK_ACTIVATIONS = "https://discord.com/api/webhooks/1457747485081731207/H1lxtguaXHk8kyHuFyyIJKfcGwfGnglbgfw5F_tQlBqm1yQYOYRzQfP4v11R1xyEw8pj"
-DISCORD_WEBHOOK_LAUNCHER = "https://discord.com/api/webhooks/1457747799167992004/ebGQI7td9BXZ5xInJ3wa6AJxmGestA1ZXb-hSTVwgi3Wm0xdwvGlOoG9pZan1QtjdAXF"
-DISCORD_WEBHOOK_ADMIN = "https://discord.com/api/webhooks/1457747886421840007/ZDHzyIJ4TaVFTG8KrxcnqhNP7tjD5GnySXPZXru4r-ca22bYWVp8uqX7dnRFT5mKnEb6"
+DISCORD_WEBHOOK_LAUNCHER     = "https://discord.com/api/webhooks/1457747799167992004/ebGQI7td9BXZ5xInJ3wa6AJxmGestA1ZXb-hSTVwgi3Wm0xdwvGlOoG9pZan1QtjdAXF"
+DISCORD_WEBHOOK_ADMIN        = "https://discord.com/api/webhooks/1457747886421840007/ZDHzyIJ4TaVFTG8KrxcnqhNP7tjD5GnySXPZXru4r-ca22bYWVp8uqX7dnRFT5mKnEb6"
 
-# --- bootstrap admin (перший доступ у bot_users) ---
+# --- bootstrap admin (твій discord id) ---
 BOOTSTRAP_DISCORD_ADMIN_ID = "1185724094734405735"
-
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 
@@ -2041,5 +2038,6 @@ def api_bot_update_upload():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
+
 
 
