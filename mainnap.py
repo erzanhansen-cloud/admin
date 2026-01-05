@@ -21,34 +21,36 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 
+
+
 # =========================
 # CONFIG (NO ENV)
 # =========================
 
-APP_SECRET = "Dev1234"  # ⚠️ зміни
+APP_SECRET = "AdminGatylo"  # НЕ став сюди Dev1234, це погано
 
-# Це "перший" PIN, якщо в БД ще не встановлений PIN.
-# Після першого логіну цей PIN автоматично запишеться в БД (як hash),
-# і далі буде працювати PIN із БД.
-ADMIN_PIN = "Dev1234"  # ⚠️ зміни
+ADMIN_PIN = "Dev1234"  # перший пін тільки для 1-го входу (потім з БД)
 
-RUNNING_WINDOW_SEC = 90  # heartbeat window (seconds)
+RUNNING_WINDOW_SEC = 90
+ACTIVATION_LOG_COOLDOWN_SEC = 600
 
-# Anti-flood: 1 activation log per (key+hwid) per N seconds (для event='activation')
-ACTIVATION_LOG_COOLDOWN_SEC = 600  # 10 хв (постав 60 якщо хочеш 1/хв)
+# --- BOT CONTROL API секрет (має співпадати з ботом 1:1) ---
+BOT_API_SECRET = "Dev1234"
 
-# Optional: сервер -> дискорд-бот webhook (зроби endpoint у бота і постав URL)
-BOT_ACTIVATION_HOOK_URL = ""  # напр: "https://YOUR-BOT.onrender.com/hook/activation"
+# --- optional webhook from server -> bot (можеш не юзати) ---
+BOT_ACTIVATION_HOOK_URL = ""
+BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"
 
-# Секрет для:
-# - webhook у бота (header X-Hook-Secret)
-# - bot-admin API (header X-Bot-Secret)
-BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"  # ⚠️ зміни
+# --- Discord logging webhooks (бот дасть після /setup) ---
+DISCORD_WEBHOOK_ACTIVATIONS = "https://discord.com/api/webhooks/1457747485081731207/H1lxtguaXHk8kyHuFyyIJKfcGwfGnglbgfw5F_tQlBqm1yQYOYRzQfP4v11R1xyEw8pj"
+DISCORD_WEBHOOK_LAUNCHER = "https://discord.com/api/webhooks/1457747799167992004/ebGQI7td9BXZ5xInJ3wa6AJxmGestA1ZXb-hSTVwgi3Wm0xdwvGlOoG9pZan1QtjdAXF"
+DISCORD_WEBHOOK_ADMIN = "https://discord.com/api/webhooks/1457747886421840007/ZDHzyIJ4TaVFTG8KrxcnqhNP7tjD5GnySXPZXru4r-ca22bYWVp8uqX7dnRFT5mKnEb6"
 
-# Bootstrap admin для бота (перший адмін, якщо bot_users ще пустий)
-BOOTSTRAP_DISCORD_ADMIN_ID = "1185724094734405735"  # ⚠️ постав свій Discord ID (строка)
+# --- bootstrap admin (перший доступ у bot_users) ---
+BOOTSTRAP_DISCORD_ADMIN_ID = "1185724094734405735"
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
 
 
 # =========================
@@ -2039,4 +2041,5 @@ def api_bot_update_upload():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
+
 
