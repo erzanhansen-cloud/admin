@@ -1,9 +1,9 @@
+ 
 import os
 import json
 import sqlite3
 import secrets
 import string
-import hashlib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
@@ -21,33 +21,22 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 
-
-
 # =========================
 # CONFIG (NO ENV)
 # =========================
 
-APP_SECRET = "AdminGatylo"          # для flask session (будь-який довгий)
-ADMIN_PIN = "Dev1234"              # перший пін, тільки для першого входу (потім буде з БД)
+APP_SECRET = "super-secret-local-key"     # ⚠️ зміни
+ADMIN_PIN = "Dev1234"                     # ⚠️ зміни
+RUNNING_WINDOW_SEC = 90                   # heartbeat window (seconds)
 
-RUNNING_WINDOW_SEC = 90
-ACTIVATION_LOG_COOLDOWN_SEC = 600
+# Anti-flood: 1 activation log per key+hwid per N seconds (для event='activation')
+ACTIVATION_LOG_COOLDOWN_SEC = 600         # 10 хв (постав 60 якщо хочеш 1/хв)
 
-# --- BOT CONTROL API секрет (має співпадати з ботом 1:1) ---
-BOT_API_SECRET = "Dev1234"
+# Optional Discord-bot hook (leave empty to disable)
+BOT_ACTIVATION_HOOK_URL = ""              # приклад: "https://YOUR-BOT.onrender.com/hook/activation"
+BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"
 
-# --- optional webhook from server -> bot (можеш НЕ юзати взагалі) ---
-BOT_ACTIVATION_HOOK_URL = ""       # лишай пустим
-BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"  # лишай як є (не використовується якщо URL пустий)
-
-# --- Discord logging webhooks (вставив твої) ---
-DISCORD_WEBHOOK_ACTIVATIONS = "https://discord.com/api/webhooks/1457747485081731207/H1lxtguaXHk8kyHuFyyIJKfcGwfGnglbgfw5F_tQlBqm1yQYOYRzQfP4v11R1xyEw8pj"
-DISCORD_WEBHOOK_LAUNCHER     = "https://discord.com/api/webhooks/1457747799167992004/ebGQI7td9BXZ5xInJ3wa6AJxmGestA1ZXb-hSTVwgi3Wm0xdwvGlOoG9pZan1QtjdAXF"
-DISCORD_WEBHOOK_ADMIN        = "https://discord.com/api/webhooks/1457747886421840007/ZDHzyIJ4TaVFTG8KrxcnqhNP7tjD5GnySXPZXru4r-ca22bYWVp8uqX7dnRFT5mKnEb6"
-
-# --- bootstrap admin (твій discord id) ---
-BOOTSTRAP_DISCORD_ADMIN_ID = "1185724094734405735"
-
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 # =========================
@@ -94,6 +83,7 @@ def parse_dt(x):
     if not x:
         return None
     try:
+        # stored as "YYYY-MM-DD HH:MM:SS"
         return datetime.strptime(str(x), "%Y-%m-%d %H:%M:%S").replace(tzinfo=KYIV_TZ)
     except ValueError:
         return None
@@ -153,6 +143,7 @@ def init_db():
     )
     """)
 
+    # ✅ activations + event
     db_execute(cur, """
     CREATE TABLE IF NOT EXISTS activations (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +160,7 @@ def init_db():
     try:
         db_execute(cur, "ALTER TABLE activations ADD COLUMN event TEXT")
     except sqlite3.OperationalError:
-        pass
+        pass  # already exists
 
     db_execute(cur, """
     CREATE TABLE IF NOT EXISTS updates (
@@ -212,38 +203,14 @@ def init_db():
             ("Тех роботи. Спробуй пізніше.",),
         )
 
-    # ===== BOT USERS + ADMIN PIN IN DB =====
-    db_execute(cur, """
-    CREATE TABLE IF NOT EXISTS bot_users (
-        discord_id TEXT PRIMARY KEY,
-        role       TEXT NOT NULL DEFAULT 'viewer',   -- viewer/staff/admin
-        note       TEXT,
-        created_at TEXT
-    )
-    """)
-
-    db_execute(cur, """
-    CREATE TABLE IF NOT EXISTS admin_auth (
-        id               INTEGER PRIMARY KEY CHECK (id = 1),
-        enabled          INTEGER NOT NULL DEFAULT 1,
-        pin_hash         TEXT,
-        fallback_enabled INTEGER NOT NULL DEFAULT 0
-    )
-    """)
-
-    row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM admin_auth")
-    if (row["c"] if row else 0) == 0:
-        db_execute(cur, "INSERT INTO admin_auth (id, enabled, pin_hash, fallback_enabled) VALUES (1, 1, NULL, 0)")
-
     try:
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_keys_key_value ON keys(key_value)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_value ON activations(key_value)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_key_hwid ON activations(key_value, hwid, id)")
-        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_event ON activations(event)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_actor ON admin_logs(actor)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_admin_logs_action ON admin_logs(action)")
         db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_updates_uploaded ON updates(uploaded_at)")
-        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_bot_users_role ON bot_users(role)")
+        db_execute(cur, "CREATE INDEX IF NOT EXISTS idx_activations_event ON activations(event)")
     except sqlite3.OperationalError:
         pass
 
@@ -295,6 +262,7 @@ def maintenance_guard():
     s = get_settings()
     if not s:
         return None
+
     sd = dict(s)
     enabled = int(sd.get("maintenance_enabled") or 0) == 1
     if enabled:
@@ -302,72 +270,11 @@ def maintenance_guard():
         return jsonify({"ok": False, "reason": "maintenance", "message": msg}), 503
     return None
 
-def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
-    dt = parse_dt(last_seen)
-    if not dt:
-        return False
-    return (kyiv_now() - dt).total_seconds() <= window_sec
-
-
-# =========================
-# ADMIN PIN stored in DB
-# =========================
-
-def _pin_hash(pin: str) -> str:
-    return hashlib.sha256(pin.encode("utf-8")).hexdigest()
-
-def get_admin_auth():
-    conn = get_db()
-    cur = conn.cursor()
-    row = db_fetchone(cur, "SELECT * FROM admin_auth WHERE id=1")
-    conn.close()
-    return dict(row) if row else {"enabled": 1, "pin_hash": None, "fallback_enabled": 0}
-
-def set_admin_pin_hash(new_hash, enabled: int = 1):
-    conn = get_db()
-    cur = conn.cursor()
-    db_execute(cur, "UPDATE admin_auth SET pin_hash=?, enabled=? WHERE id=1", (new_hash, int(enabled)))
-    conn.commit()
-    conn.close()
-
-def set_admin_enabled(enabled: int):
-    conn = get_db()
-    cur = conn.cursor()
-    db_execute(cur, "UPDATE admin_auth SET enabled=? WHERE id=1", (int(enabled),))
-    conn.commit()
-    conn.close()
-
-def verify_admin_pin(pin: str) -> bool:
-    a = get_admin_auth()
-    if int(a.get("enabled", 1)) != 1:
-        return False
-
-    pin = (pin or "").strip()
-    if not pin:
-        return False
-
-    h = a.get("pin_hash")
-    if h:
-        return _pin_hash(pin) == h
-
-    # if DB pin not set yet -> allow ADMIN_PIN once, then write into DB
-    if pin == ADMIN_PIN:
-        set_admin_pin_hash(_pin_hash(pin), enabled=1)
-        return True
-
-    return False
-
-
-# =========================
-# MAINTENANCE GLOBAL
-# =========================
-
 @app.before_request
 def global_maintenance():
     if request.endpoint == "static":
         return None
 
-    # allow login/logout/health + settings page
     ep = request.endpoint or ""
     allowed = {"healthz", "login", "logout", "page_settings"}
     if ep in allowed:
@@ -384,10 +291,7 @@ def global_maintenance():
 
     msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
 
-    # API: allow bot-admin endpoints during maintenance
     if request.path.startswith("/api/"):
-        if request.path.startswith("/api/bot/"):
-            return None
         return jsonify({"ok": False, "reason": "maintenance", "message": msg}), 503
 
     return (
@@ -402,12 +306,21 @@ def global_maintenance():
         503,
     )
 
+def is_running(last_seen, window_sec=RUNNING_WINDOW_SEC) -> bool:
+    dt = parse_dt(last_seen)
+    if not dt:
+        return False
+    return (kyiv_now() - dt).total_seconds() <= window_sec
+
 
 # =========================
 # BOT NOTIFY (optional)
 # =========================
 
-def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at: str):
+def _to_iso(x):
+    return str(x or "")
+
+def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at):
     if not BOT_ACTIVATION_HOOK_URL:
         return
 
@@ -416,7 +329,7 @@ def notify_bot_activation(key_value: str, hwid: str, ip: str, created_at: str):
         "key": key_value,
         "hwid": hwid,
         "ip": ip,
-        "created_at": str(created_at or ""),
+        "created_at": _to_iso(created_at),
     }
 
     try:
@@ -746,10 +659,10 @@ def login():
     error = None
     if request.method == "POST":
         pin = (request.form.get("pin") or "").strip()
-        if verify_admin_pin(pin):
+        if pin == ADMIN_PIN:
             session["admin_authed"] = True
             return redirect("/")
-        error = "Неправильний PIN або логін вимкнений"
+        error = "Неправильний PIN"
     return render_template_string(LOGIN_HTML, base_css=BASE_CSS, error=error)
 
 @app.route("/logout")
@@ -824,7 +737,7 @@ def page_keys():
       <td>{{{{k.id}}}}</td>
 
       <td>
-        <input style="min-width:260px;" name="key_value" form="f{{{{k.id}}}}" value="{{{{k.key_value}}}}">
+        <input class="tbl-input" style="min-width:260px;" name="key_value" form="f{{{{k.id}}}}" value="{{{{k.key_value}}}}">
       </td>
 
       <td>
@@ -835,8 +748,8 @@ def page_keys():
         {{% endif %}}
       </td>
 
-      <td><input style="min-width:200px;" name="owner" form="f{{{{k.id}}}}" value="{{{{k.owner or ''}}}}"></td>
-      <td><input style="min-width:240px;" name="note" form="f{{{{k.id}}}}" value="{{{{k.note or ''}}}}"></td>
+      <td><input class="tbl-input" style="min-width:200px;" name="owner" form="f{{{{k.id}}}}" value="{{{{k.owner or ''}}}}"></td>
+      <td><input class="tbl-input" style="min-width:240px;" name="note" form="f{{{{k.id}}}}" value="{{{{k.note or ''}}}}"></td>
 
       <td style="text-align:center;">
         <input type="checkbox" name="is_active" value="1" form="f{{{{k.id}}}}" {{% if k.is_active %}}checked{{% endif %}}>
@@ -846,11 +759,11 @@ def page_keys():
         <input type="checkbox" name="is_banned" value="1" form="f{{{{k.id}}}}" {{% if k.is_banned %}}checked{{% endif %}}>
       </td>
 
-      <td><input name="ban_reason" form="f{{{{k.id}}}}" value="{{{{k.ban_reason or ''}}}}"></td>
+      <td><input class="tbl-input" name="ban_reason" form="f{{{{k.id}}}}" value="{{{{k.ban_reason or ''}}}}"></td>
 
-      <td><input style="min-width:200px;" name="expires_at" form="f{{{{k.id}}}}" placeholder="YYYY-MM-DD HH:MM:SS" value="{{{{k.expires_at or ''}}}}"></td>
+      <td><input class="tbl-input" style="min-width:200px;" name="expires_at" form="f{{{{k.id}}}}" placeholder="YYYY-MM-DD HH:MM:SS" value="{{{{k.expires_at or ''}}}}"></td>
 
-      <td><input style="min-width:320px;" name="hwid" form="f{{{{k.id}}}}" value="{{{{k.hwid or ''}}}}"></td>
+      <td><input class="tbl-input" style="min-width:320px;" name="hwid" form="f{{{{k.id}}}}" value="{{{{k.hwid or ''}}}}"></td>
 
       <td style="font-size:12px;color:#ddd;">{{{{k.last_seen or ''}}}}</td>
 
@@ -870,7 +783,7 @@ def page_keys():
             <button class="btn-muted btn-small" type="submit">Clear HWID</button>
           </form>
 
-          <form method="post" action="/key/delete/{{{{k.id}}}}" onsubmit="return confirm('Видалити ключ?');">
+          <form method="post" action="/key/delete/{{{{k.id}}}}">
             <button class="btn-muted btn-small" type="submit">Del</button>
           </form>
         </div>
@@ -1055,7 +968,7 @@ def page_launcher_logs():
       <td>{{{{l.created_at}}}}</td>
       <td>{{{{l.action}}}}</td>
       <td>{{{{l.key_value or ''}}}}</td>
-      <td style="font-size:12px;color:#ddd; white-space:normal;">{{{{l.details or ''}}}}</td>
+      <td style="font-size:12px;color:#ddd;">{{{{l.details or ''}}}}</td>
       <td>{{{{l.ip or ''}}}}</td>
     </tr>
     {{% endfor %}}
@@ -1136,7 +1049,7 @@ def page_updates():
       <td>{{{{u.filename}}}}</td>
       <td>{{{{u.version or '-' }}}}</td>
       <td>{{{{"%.2f"|format((u.size_bytes or 0)/1024/1024)}}}}</td>
-      <td style="white-space:normal;">{{{{u.note or ''}}}}</td>
+      <td>{{{{u.note or ''}}}}</td>
     </tr>
     {{% endfor %}}
   </table>
@@ -1167,10 +1080,6 @@ def page_settings():
     enabled = int(sd.get("maintenance_enabled") or 0)
     msg = sd.get("maintenance_message") or "Тех роботи. Спробуй пізніше."
 
-    a = get_admin_auth()
-    pin_enabled = bool(int(a.get("enabled", 1)))
-    has_db_pin = bool(a.get("pin_hash"))
-
     html = f"""
 <!DOCTYPE html>
 <html lang="uk">
@@ -1182,6 +1091,7 @@ def page_settings():
 <div class="panel">
 
   <div class="section-title">Тех роботи (вимкнути лаунчер/API)</div>
+
   <form method="post" action="/settings">
     <div class="form-row">
       <label style="display:flex; align-items:center; gap:8px;">
@@ -1197,15 +1107,6 @@ def page_settings():
 
     <button class="btn-main" type="submit">Зберегти</button>
   </form>
-
-  <div class="section-title" style="margin-top:22px;">Admin PIN (через БД)</div>
-  <div style="font-size:13px;color:#cfcfcf;opacity:.9;line-height:1.5">
-    Статус: <b style="color:#ffb35c">{'ENABLED' if pin_enabled else 'DISABLED'}</b> ·
-    PIN у БД: <b style="color:#ffb35c">{'YES' if has_db_pin else 'NO (візьме ADMIN_PIN при першому логіні)'}</b>
-    <div style="opacity:.75;margin-top:6px;">
-      PIN ротейтиш/вимикаєш через Discord-бот API: <code>/api/bot/admin_pin/*</code>
-    </div>
-  </div>
 
 </div>
 </body></html>
@@ -1415,7 +1316,7 @@ def api_status():
     })
 
 # ✅ check_key:
-# - якщо ключ валідний -> ЗАВЖДИ пишемо event='enter' в activations
+# - якщо ключ валідний -> ЗАВЖДИ пишемо event='enter' в activations (вхід лаунчера)
 # - додатково (антифлуд) event='activation' раз на cooldown
 @app.route("/api/check_key", methods=["POST"])
 def api_check_key():
@@ -1465,14 +1366,14 @@ def api_check_key():
             conn.close()
             return jsonify({"ok": False, "reason": "hwid_mismatch"})
 
-    # ✅ 1) LOG входу
+    # ✅ 1) ЛОГ КОЖНОГО ВХОДУ (видно на /activations)
     db_execute(
         cur,
         "INSERT INTO activations (key_id, key_value, hwid, ip, event, created_at) VALUES (?,?,?,?,?,?)",
         (row["id"], row["key_value"], hwid, ip, "enter", nowv),
     )
 
-    # ✅ 2) activation anti-flood
+    # ✅ 2) Анти-флуд лог "activation" (опціонально)
     do_log = should_log_activation(cur, row["key_value"], hwid, ACTIVATION_LOG_COOLDOWN_SEC)
     if do_log:
         db_execute(
@@ -1484,20 +1385,14 @@ def api_check_key():
     conn.commit()
     conn.close()
 
-    # ✅ webhook
+    # ✅ discord hook (по бажанню) — тільки якщо перша активація + антифлуд спрацював
     if do_log and first_activation:
         try:
             notify_bot_activation(key_value=row["key_value"], hwid=hwid, ip=ip, created_at=nowv)
         except Exception:
             pass
 
-    return jsonify({
-        "ok": True,
-        "reason": "ok",
-        "enter_logged": True,
-        "activation_logged": bool(do_log),
-        "first": bool(first_activation)
-    })
+    return jsonify({"ok": True, "reason": "ok", "enter_logged": True, "activation_logged": bool(do_log), "first": bool(first_activation)})
 
 @app.route("/api/heartbeat", methods=["POST"])
 def api_heartbeat():
@@ -1603,13 +1498,13 @@ def api_updates_latest_download():
 
 
 # =========================
-# DS API (KEYS) - create (admin pin from DB)
+# DS API (KEYS) - simple create
 # =========================
 
 @app.route("/api/ds/key/create", methods=["POST"])
 def api_ds_key_create():
     pin = (request.headers.get("X-Admin-Pin") or "").strip()
-    if not verify_admin_pin(pin):
+    if pin != ADMIN_PIN:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or request.form
@@ -1677,367 +1572,8 @@ def api_ds_key_create():
 
 
 # =========================
-# BOT ADMIN API (Discord bot)
-# =========================
-
-ROLE_ORDER = {"viewer": 0, "staff": 1, "admin": 2}
-
-def bot_auth_guard():
-    sec = (request.headers.get("X-Bot-Secret") or "").strip()
-    if not BOT_HOOK_SECRET or sec != BOT_HOOK_SECRET:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return None
-
-def bot_count_users() -> int:
-    conn = get_db()
-    cur = conn.cursor()
-    row = db_fetchone(cur, "SELECT COUNT(*) AS c FROM bot_users")
-    conn.close()
-    return int(row["c"] if row else 0)
-
-def get_bot_role(discord_id: str) -> str:
-    if not discord_id:
-        return "viewer"
-    conn = get_db()
-    cur = conn.cursor()
-    row = db_fetchone(cur, "SELECT role FROM bot_users WHERE discord_id=?", (discord_id,))
-    conn.close()
-    if not row:
-        return "viewer"
-    return (row["role"] or "viewer").strip().lower()
-
-def is_bootstrap_admin(discord_id: str) -> bool:
-    return bool(BOOTSTRAP_DISCORD_ADMIN_ID and discord_id == BOOTSTRAP_DISCORD_ADMIN_ID)
-
-def require_bot_role(min_role: str):
-    def deco(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            g = bot_auth_guard()
-            if g:
-                return g
-
-            actor = (request.headers.get("X-Discord-Id") or "").strip()
-            role = get_bot_role(actor)
-
-            # bootstrap: якщо bot_users пустий -> BOOTSTRAP_DISCORD_ADMIN_ID має admin
-            if bot_count_users() == 0 and is_bootstrap_admin(actor):
-                role = "admin"
-
-            if ROLE_ORDER.get(role, 0) < ROLE_ORDER.get(min_role, 0):
-                return jsonify({"ok": False, "error": "forbidden", "role": role}), 403
-
-            return fn(*args, **kwargs)
-        return wrapper
-    return deco
-
-@app.route("/api/bot/ping")
-@require_bot_role("viewer")
-def api_bot_ping():
-    return jsonify({"ok": True})
-
-# ---- users/roles ----
-@app.route("/api/bot/users/set_role", methods=["POST"])
-@require_bot_role("admin")
-def api_bot_users_set_role():
-    data = request.get_json(silent=True) or {}
-    discord_id = (data.get("discord_id") or "").strip()
-    role = (data.get("role") or "viewer").strip().lower()
-    note = (data.get("note") or "").strip() or None
-
-    if not discord_id:
-        return jsonify({"ok": False, "error": "missing_discord_id"}), 400
-    if role not in ROLE_ORDER:
-        return jsonify({"ok": False, "error": "bad_role"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    exists = db_fetchone(cur, "SELECT discord_id FROM bot_users WHERE discord_id=?", (discord_id,))
-    if exists:
-        db_execute(cur, "UPDATE bot_users SET role=?, note=? WHERE discord_id=?", (role, note, discord_id))
-    else:
-        db_execute(cur, "INSERT INTO bot_users (discord_id, role, note, created_at) VALUES (?,?,?,?)",
-                   (discord_id, role, note, now_value()))
-    conn.commit()
-    conn.close()
-
-    log_action("bot", "set_role", None, None, f"{discord_id} => {role}")
-    return jsonify({"ok": True, "discord_id": discord_id, "role": role})
-
-@app.route("/api/bot/users/list")
-@require_bot_role("admin")
-def api_bot_users_list():
-    conn = get_db()
-    cur = conn.cursor()
-    rows = db_fetchall(cur, "SELECT discord_id, role, note, created_at FROM bot_users ORDER BY created_at DESC LIMIT 300")
-    conn.close()
-    return jsonify({"ok": True, "rows": [dict(r) for r in rows]})
-
-# ---- admin pin management ----
-def _gen_admin_pin():
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return "".join(secrets.choice(alphabet) for _ in range(10))
-
-@app.route("/api/bot/admin_pin/rotate", methods=["POST"])
-@require_bot_role("admin")
-def api_bot_admin_pin_rotate():
-    new_pin = _gen_admin_pin()
-    set_admin_pin_hash(_pin_hash(new_pin), enabled=1)
-    log_action("bot", "admin_pin_rotate", None, None, "rotated")
-    return jsonify({"ok": True, "new_pin": new_pin, "note": "Показано 1 раз. Збережи!"})
-
-@app.route("/api/bot/admin_pin/disable", methods=["POST"])
-@require_bot_role("admin")
-def api_bot_admin_pin_disable():
-    set_admin_enabled(0)
-    log_action("bot", "admin_pin_disable", None, None, "disabled admin login")
-    return jsonify({"ok": True, "enabled": False})
-
-@app.route("/api/bot/admin_pin/enable", methods=["POST"])
-@require_bot_role("admin")
-def api_bot_admin_pin_enable():
-    set_admin_enabled(1)
-    log_action("bot", "admin_pin_enable", None, None, "enabled admin login")
-    return jsonify({"ok": True, "enabled": True})
-
-@app.route("/api/bot/admin_pin/status")
-@require_bot_role("admin")
-def api_bot_admin_pin_status():
-    a = get_admin_auth()
-    return jsonify({
-        "ok": True,
-        "enabled": bool(int(a.get("enabled", 1))),
-        "has_pin": bool(a.get("pin_hash")),
-        "fallback_enabled": bool(int(a.get("fallback_enabled", 0))),
-    })
-
-# ---- maintenance ----
-@app.route("/api/bot/maintenance/set", methods=["POST"])
-@require_bot_role("admin")
-def api_bot_maintenance_set():
-    data = request.get_json(silent=True) or {}
-    enabled = 1 if bool(data.get("enabled")) else 0
-    msg = (data.get("message") or "").strip() or "Тех роботи. Спробуй пізніше."
-
-    conn = get_db()
-    cur = conn.cursor()
-    db_execute(cur, "UPDATE app_settings SET maintenance_enabled=?, maintenance_message=? WHERE id=1", (enabled, msg))
-    conn.commit()
-    conn.close()
-
-    log_action("bot", "set_maintenance", None, None, f"enabled={enabled}")
-    return jsonify({"ok": True, "enabled": bool(enabled), "message": msg})
-
-# ---- logs ----
-@app.route("/api/bot/logs/activations")
-@require_bot_role("viewer")
-def api_bot_logs_activations():
-    q = (request.args.get("q") or "").strip()
-    try:
-        limit = int(request.args.get("limit") or "50")
-    except ValueError:
-        limit = 50
-    limit = max(1, min(200, limit))
-
-    conn = get_db()
-    cur = conn.cursor()
-    if q:
-        pat = f"%{q}%"
-        rows = db_fetchall(
-            cur,
-            """
-            SELECT id, event, key_value, hwid, ip, created_at
-            FROM activations
-            WHERE key_value LIKE ? OR hwid LIKE ? OR ip LIKE ? OR event LIKE ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (pat, pat, pat, pat, limit),
-        )
-    else:
-        rows = db_fetchall(
-            cur,
-            "SELECT id, event, key_value, hwid, ip, created_at FROM activations ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-    conn.close()
-    return jsonify({"ok": True, "rows": [dict(r) for r in rows]})
-
-@app.route("/api/bot/logs/launcher")
-@require_bot_role("viewer")
-def api_bot_logs_launcher():
-    q = (request.args.get("q") or "").strip()
-    try:
-        limit = int(request.args.get("limit") or "50")
-    except ValueError:
-        limit = 50
-    limit = max(1, min(200, limit))
-
-    conn = get_db()
-    cur = conn.cursor()
-    if q:
-        pat = f"%{q}%"
-        rows = db_fetchall(
-            cur,
-            """
-            SELECT id, action, key_value, details, ip, created_at
-            FROM admin_logs
-            WHERE actor='launcher' AND (action LIKE ? OR key_value LIKE ? OR details LIKE ? OR ip LIKE ?)
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (pat, pat, pat, pat, limit),
-        )
-    else:
-        rows = db_fetchall(
-            cur,
-            """
-            SELECT id, action, key_value, details, ip, created_at
-            FROM admin_logs
-            WHERE actor='launcher'
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-    conn.close()
-    return jsonify({"ok": True, "rows": [dict(r) for r in rows]})
-
-# ---- key actions ----
-@app.route("/api/bot/key/ban", methods=["POST"])
-@require_bot_role("staff")
-def api_bot_key_ban():
-    data = request.get_json(silent=True) or {}
-    key_value = (data.get("key") or "").strip()
-    reason = (data.get("reason") or "bot ban").strip()
-    if not key_value:
-        return jsonify({"ok": False, "error": "missing_key"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    row = db_fetchone(cur, "SELECT id, key_value FROM keys WHERE key_value=?", (key_value,))
-    if not row:
-        conn.close()
-        return jsonify({"ok": False, "error": "not_found"}), 404
-
-    db_execute(cur, "UPDATE keys SET is_banned=1, ban_reason=? WHERE id=?", (reason, row["id"]))
-    conn.commit()
-    conn.close()
-    log_action("bot", "ban_key", row["id"], row["key_value"], reason)
-    return jsonify({"ok": True})
-
-@app.route("/api/bot/key/unban", methods=["POST"])
-@require_bot_role("staff")
-def api_bot_key_unban():
-    data = request.get_json(silent=True) or {}
-    key_value = (data.get("key") or "").strip()
-    if not key_value:
-        return jsonify({"ok": False, "error": "missing_key"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    row = db_fetchone(cur, "SELECT id, key_value FROM keys WHERE key_value=?", (key_value,))
-    if not row:
-        conn.close()
-        return jsonify({"ok": False, "error": "not_found"}), 404
-
-    db_execute(cur, "UPDATE keys SET is_banned=0, ban_reason=NULL WHERE id=?", (row["id"],))
-    conn.commit()
-    conn.close()
-    log_action("bot", "unban_key", row["id"], row["key_value"], None)
-    return jsonify({"ok": True})
-
-@app.route("/api/bot/key/clear_hwid", methods=["POST"])
-@require_bot_role("staff")
-def api_bot_key_clear_hwid():
-    data = request.get_json(silent=True) or {}
-    key_value = (data.get("key") or "").strip()
-    if not key_value:
-        return jsonify({"ok": False, "error": "missing_key"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    row = db_fetchone(cur, "SELECT id, key_value FROM keys WHERE key_value=?", (key_value,))
-    if not row:
-        conn.close()
-        return jsonify({"ok": False, "error": "not_found"}), 404
-
-    db_execute(cur, "UPDATE keys SET hwid=NULL WHERE id=?", (row["id"],))
-    conn.commit()
-    conn.close()
-    log_action("bot", "clear_hwid", row["id"], row["key_value"], None)
-    return jsonify({"ok": True})
-
-@app.route("/api/bot/key/delete", methods=["POST"])
-@require_bot_role("admin")
-def api_bot_key_delete():
-    data = request.get_json(silent=True) or {}
-    key_value = (data.get("key") or "").strip()
-    if not key_value:
-        return jsonify({"ok": False, "error": "missing_key"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    row = db_fetchone(cur, "SELECT id, key_value FROM keys WHERE key_value=?", (key_value,))
-    if not row:
-        conn.close()
-        return jsonify({"ok": False, "error": "not_found"}), 404
-
-    db_execute(cur, "DELETE FROM keys WHERE id=?", (row["id"],))
-    deleted = getattr(cur, "rowcount", 0)
-    conn.commit()
-    conn.close()
-    log_action("bot", "delete_key", row["id"], row["key_value"], f"deleted={deleted}")
-    return jsonify({"ok": True, "deleted": int(deleted)})
-
-# ---- upload update via bot ----
-@app.route("/api/bot/update/upload", methods=["POST"])
-@require_bot_role("admin")
-def api_bot_update_upload():
-    file = request.files.get("file")
-    if not file or file.filename == "":
-        return jsonify({"ok": False, "error": "missing_file"}), 400
-
-    version = (request.form.get("version") or "").strip()
-    note = (request.form.get("note") or "").strip()
-
-    safe_name = secure_filename(file.filename)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stored_name = f"{ts}_{safe_name}"
-    stored_path = os.path.join(STORAGE_DIR, stored_name)
-
-    file.save(stored_path)
-    size_bytes = os.path.getsize(stored_path)
-
-    conn = get_db()
-    cur = conn.cursor()
-    new_id = db_insert_returning_id(
-        cur,
-        "INSERT INTO updates (filename, stored_path, version, note, uploaded_at, size_bytes) VALUES (?,?,?,?,?,?)",
-        (safe_name, stored_name, version, note, now_value(), size_bytes),
-    )
-    conn.commit()
-    conn.close()
-
-    log_action("bot", "upload_update", None, None, f"id={new_id}, file={safe_name}, version={version}")
-
-    return jsonify({
-        "ok": True,
-        "id": new_id,
-        "filename": safe_name,
-        "version": version,
-        "note": note,
-        "size_bytes": size_bytes,
-        "uploaded_at": now_value(),
-    })
-
-
-# =========================
 # RUN
 # =========================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
-
-
-
