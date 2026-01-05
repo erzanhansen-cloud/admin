@@ -25,7 +25,7 @@ from werkzeug.utils import secure_filename
 # CONFIG (NO ENV)
 # =========================
 
-APP_SECRET = "CHANGE_ME_APP_SECRET"  # ⚠️ зміни
+APP_SECRET = "Dev1234"  # ⚠️ зміни
 
 # Це "перший" PIN, якщо в БД ще не встановлений PIN.
 # Після першого логіну цей PIN автоматично запишеться в БД (як hash),
@@ -46,7 +46,7 @@ BOT_ACTIVATION_HOOK_URL = ""  # напр: "https://YOUR-BOT.onrender.com/hook/ac
 BOT_HOOK_SECRET = "CHANGE_ME_SUPER_SECRET"  # ⚠️ зміни
 
 # Bootstrap admin для бота (перший адмін, якщо bot_users ще пустий)
-BOOTSTRAP_DISCORD_ADMIN_ID = ""  # ⚠️ постав свій Discord ID (строка)
+BOOTSTRAP_DISCORD_ADMIN_ID = "1185724094734405735"  # ⚠️ постав свій Discord ID (строка)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -2039,3 +2039,4 @@ def api_bot_update_upload():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
+
