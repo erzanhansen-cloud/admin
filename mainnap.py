@@ -26,7 +26,7 @@ from werkzeug.utils import secure_filename
 # =========================
 
 APP_SECRET = "super-secret-local-key"     # ⚠️ зміни
-ADMIN_PIN = "Dev1234"                     # ⚠️ зміни
+ADMIN_PIN = "GatyloDev"                     # ⚠️ зміни
 RUNNING_WINDOW_SEC = 90                   # heartbeat window (seconds)
 
 # Anti-flood: 1 activation log per key+hwid per N seconds (для event='activation')
@@ -1577,3 +1577,4 @@ def api_ds_key_create():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
+
